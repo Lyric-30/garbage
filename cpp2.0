@@ -1,0 +1,634 @@
+#define _CRT_SECURE_NO_WARNINGS
+#ifndef RGBA
+#define RGBA(r,g,b,a) ((COLORREF)(((BYTE)(r)|((WORD)((BYTE)(g))<<8))|(((DWORD)(BYTE)(b))<<16)|(((DWORD)(BYTE)(a))<<24)))
+#endif
+
+#include <graphics.h>
+#include <conio.h>
+#include <windows.h>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+// ===================== 资源路径定义 =====================
+#define RES_CLASSROOM_BG   _T("res/bg_classroom.jpg")
+#define RES_EXAM_BG        _T("res/bg_exam.jpg")
+#define RES_VOLUNTEER_BG   _T("res/bg_volunteer.jpg")
+#define RES_UI_BOOK        _T("res/ui_book.png")
+#define RES_UI_PHONE       _T("res/ui_phone.png")
+
+// ===================== 全局常量定义 =====================
+enum Scene { SCENE_CLASSROOM, SCENE_EXAM, SCENE_VOLUNTEER, SCENE_ENDING };
+enum Subject { CHINESE, MATH, ENGLISH, SCIENCE, SUBJECT_COUNT };
+const int MAX_GAME_DAY = 30; // 游戏最大天数，统一管理
+
+// 题目结构体
+struct Question {
+    wstring title;
+    wstring options[4];
+    int correctIndex;
+    Subject subject;
+};
+
+// 按钮结构体
+struct ClickArea {
+    int x, y, width, height;
+    wstring text;
+    bool isHover;
+    bool isEnable;
+};
+
+// ===================== 游戏状态结构体 =====================
+struct GameState {
+    int day;
+    int subjectScore[SUBJECT_COUNT];
+    int totalScore;
+    int fatigue;
+    Scene currentScene;
+    bool gameOver;
+    int volunteerChoice;
+    wstring eventText;
+    wstring resultText;
+    int mouseX, mouseY;
+
+    // 答题状态
+    bool isAnswering;
+    Question currentQuestion;
+    int answerTimeLeft;
+    bool isMonthlyExam;
+    bool isFinalExam;
+    bool finalExamTriggered; // 新增：高考是否已经触发，避免重复触发
+
+    // 小游戏状态
+    bool isPlayingHideGame;
+    int hideGameTimer;
+    bool teacherIsComing;
+};
+
+// ===================== 全局资源与变量 =====================
+GameState game;
+vector<Question> questionBank; // 动态题库
+
+// 图片资源对象
+IMAGE g_imgClassroomBg, g_imgExamBg, g_imgVolunteerBg;
+IMAGE g_imgBook, g_imgPhone;
+
+// 互动区域
+ClickArea areaBook = { 200, 400, 140, 80, L"课本\n(刷题答题)", false, true };
+ClickArea areaBlackboard = { 300, 100, 200, 120, L"黑板\n(认真听课)", false, true };
+ClickArea areaPhone = { 500, 450, 100, 50, L"手机\n(摸鱼休息)", false, true };
+ClickArea areaCalendar = { 650, 100, 100, 80, L"日历", false, false };
+ClickArea areaOption[4] = {
+    {150, 400, 250, 60, L"A. ", false, true},
+    {450, 400, 250, 60, L"B. ", false, true},
+    {150, 480, 250, 60, L"C. ", false, true},
+    {450, 480, 250, 60, L"D. ", false, true}
+};
+ClickArea areaVolunteer[7] = {
+    {200, 250, 400, 40, L"清华大学/北京大学（需680+）", false, true},
+    {200, 300, 400, 40, L"985工程大学（需600+）", false, true},
+    {200, 350, 400, 40, L"211工程大学（需550+）", false, true},
+    {200, 400, 400, 40, L"普通一本大学（需500+）", false, true},
+    {200, 450, 400, 40, L"二本/三本大学（需400+）", false, true},
+    {200, 500, 400, 40, L"专科学校（需200+）", false, true},
+    {200, 550, 400, 40, L"复读一年", false, true}
+};
+
+// ===================== 函数声明 =====================
+void InitGame();
+void InitResources();
+void InitQuestionBank();
+void ResetAllHoverState();
+void DrawScene();
+void DrawClassroom();
+void DrawExam();
+void DrawVolunteer();
+void DrawEnding();
+void DrawButton(ClickArea& btn, COLORREF normalCol, COLORREF hoverCol);
+void DrawUIText(int x, int y, LPCTSTR str, int size, COLORREF color);
+
+void HandleMouseClick(int x, int y);
+void UpdateHoverState(int x, int y);
+void RandomEvent();
+void GenerateRandomQuestion();
+void StartMonthlyExam();
+void StartFinalExam();
+void GenerateResult();
+void RestartGame();
+void UpdateTotalScore();
+
+// ===================== 主函数 =====================
+int main() {
+    initgraph(800, 650);
+    BeginBatchDraw();
+    setbkcolor(WHITE);
+    cleardevice();
+
+    InitResources();
+    InitQuestionBank();
+    InitGame();
+
+    while (true) {
+        // 获取鼠标
+        POINT mouse_msg;
+        GetCursorPos(&mouse_msg);
+        ScreenToClient(GetHWnd(), &mouse_msg);
+        game.mouseX = mouse_msg.x;
+        game.mouseY = mouse_msg.y;
+        UpdateHoverState(game.mouseX, game.mouseY);
+
+        // 绘制
+        DrawScene();
+        FlushBatchDraw();
+
+        // 答题倒计时
+        if (game.currentScene == SCENE_EXAM && game.answerTimeLeft > 0) {
+            static int timeCounter = 0;
+            if (++timeCounter >= 100) {
+                game.answerTimeLeft--; timeCounter = 0;
+                if (game.answerTimeLeft <= 0) {
+                    game.eventText = L"答题超时！本次答题无效";
+                    game.currentScene = SCENE_CLASSROOM;
+                    if (game.day < MAX_GAME_DAY) game.day++;
+                }
+            }
+        }
+        // 躲班主任游戏倒计时
+        if (game.isPlayingHideGame) {
+            static int hideCounter = 0;
+            if (++hideCounter >= 50) {
+                game.hideGameTimer--; hideCounter = 0;
+                if (game.hideGameTimer <= 0) {
+                    if (game.teacherIsComing) {
+                        game.eventText = L"被班主任抓到了！扣20分，疲劳+30";
+                        game.totalScore -= 20; game.fatigue += 30;
+                    }
+                    else {
+                        game.eventText = L"摸鱼成功！疲劳-30";
+                        game.fatigue -= 30;
+                    }
+                    game.isPlayingHideGame = false;
+                    if (game.day < MAX_GAME_DAY) game.day++;
+                }
+            }
+        }
+
+        // 点击处理
+        if (MouseHit()) {
+            MOUSEMSG msg = GetMouseMsg();
+            if (msg.uMsg == WM_LBUTTONDOWN) HandleMouseClick(msg.x, msg.y);
+        }
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break;
+        Sleep(10);
+    }
+
+    EndBatchDraw();
+    closegraph();
+    return 0;
+}
+
+// ===================== 资源与初始化 =====================
+void InitResources() {
+    loadimage(&g_imgClassroomBg, RES_CLASSROOM_BG, 800, 650);
+    loadimage(&g_imgExamBg, RES_EXAM_BG, 800, 650);
+    loadimage(&g_imgVolunteerBg, RES_VOLUNTEER_BG, 800, 650);
+    loadimage(&g_imgBook, RES_UI_BOOK, 140, 80);
+    loadimage(&g_imgPhone, RES_UI_PHONE, 100, 50);
+}
+
+void InitQuestionBank() {
+    questionBank.push_back({ L"鲁迅的原名是？", {L"周树人", L"周作人", L"周建人", L"周恩来"}, 0, CHINESE });
+    questionBank.push_back({ L"1+2*3+4的计算结果是？", {L"13", L"11", L"15", L"9"}, 1, MATH });
+    questionBank.push_back({ L"以下哪个是英语元音字母？", {L"B", L"C", L"A", L"D"}, 2, ENGLISH });
+    questionBank.push_back({ L"水的化学式是？", {L"H2O", L"CO2", L"NaCl", L"O2"}, 0, SCIENCE });
+    questionBank.push_back({ L"《静夜思》的作者是？", {L"杜甫", L"李白", L"白居易", L"王维"}, 1, CHINESE });
+    questionBank.push_back({ L"圆的面积公式是？", {L"π乘以半径", L"2πR", L"πR²", L"半径平方"}, 2, MATH });
+    questionBank.push_back({ L"\"Thank you\"的回答是？", {L"No thanks", L"You're welcome", L"Sorry", L"Goodbye"}, 1, ENGLISH });
+    questionBank.push_back({ L"牛顿第一定律又称？", {L"惯性定律", L"能量守恒", L"万有引力", L"热力学"}, 0, SCIENCE });
+}
+
+void InitGame() {
+    srand((unsigned int)time(NULL));
+    game.day = 1;
+    for (int i = 0; i < SUBJECT_COUNT; i++) game.subjectScore[i] = 90;
+    UpdateTotalScore();
+    game.fatigue = 0;
+    game.currentScene = SCENE_CLASSROOM;
+    game.gameOver = false;
+    game.volunteerChoice = -1;
+    game.eventText = L"高三开学啦！距离高考还有30天，点击场景内的物品开始行动";
+    game.resultText = L"";
+    game.isAnswering = false;
+    game.answerTimeLeft = 0;
+    game.finalExamTriggered = false;
+    game.isPlayingHideGame = false;
+    ResetAllHoverState();
+}
+
+// ===================== 场景绘制逻辑 =====================
+void DrawScene() {
+    cleardevice();
+    switch (game.currentScene) {
+    case SCENE_CLASSROOM: DrawClassroom(); break;
+    case SCENE_EXAM: DrawExam(); break;
+    case SCENE_VOLUNTEER: DrawVolunteer(); break;
+    case SCENE_ENDING: DrawEnding(); break;
+    }
+}
+
+void DrawClassroom() {
+    // 绘制背景图
+    if (g_imgClassroomBg.getwidth() != 0) {
+        putimage(0, 0, &g_imgClassroomBg);
+    }
+    else {
+        setfillcolor(RGB(240, 240, 240));
+        fillrectangle(0, 0, 800, 650);
+    }
+
+    // 绘制黑板区域
+    if (g_imgClassroomBg.getwidth() == 0) {
+        setfillcolor(areaBlackboard.isHover ? RGB(60, 60, 60) : RGB(40, 40, 40));
+        fillrectangle(areaBlackboard.x, areaBlackboard.y, areaBlackboard.x + areaBlackboard.width, areaBlackboard.y + areaBlackboard.height);
+    }
+    setbkmode(TRANSPARENT);
+    DrawUIText(330, 140, _T("高考倒计时"), 24, WHITE);
+    TCHAR countdown[20];
+    int remainDay = max(0, MAX_GAME_DAY + 1 - game.day); // 修复：倒计时绝对不会负数
+    _stprintf_s(countdown, _T("%d天"), remainDay);
+    DrawUIText(360, 180, countdown, 24, YELLOW);
+
+    // 绘制课本
+    if (g_imgBook.getwidth() != 0) {
+        putimage(areaBook.x, areaBook.y, &g_imgBook);
+        if (areaBook.isHover) {
+            setlinecolor(RED); setlinestyle(PS_SOLID, 3);
+            rectangle(areaBook.x, areaBook.y, areaBook.x + areaBook.width, areaBook.y + areaBook.height);
+        }
+    }
+    else {
+        DrawButton(areaBook, RGB(255, 250, 240), RGB(255, 240, 180));
+        DrawUIText(areaBook.x + 20, areaBook.y + 20, areaBook.text.c_str(), 16, BLACK);
+    }
+
+    // 绘制手机
+    if (g_imgPhone.getwidth() != 0) {
+        putimage(areaPhone.x, areaPhone.y, &g_imgPhone);
+        if (areaPhone.isHover) {
+            setlinecolor(RED); setlinestyle(PS_SOLID, 3);
+            rectangle(areaPhone.x, areaPhone.y, areaPhone.x + areaPhone.width, areaPhone.y + areaPhone.height);
+        }
+    }
+    else {
+        DrawButton(areaPhone, RGB(30, 30, 30), RGB(60, 60, 60));
+        DrawUIText(areaPhone.x + 5, areaPhone.y + 10, areaPhone.text.c_str(), 16, WHITE);
+    }
+
+    // 状态栏
+    setfillcolor(RGBA(0, 0, 0, 150));
+    solidrectangle(40, 40, 760, 80);
+    TCHAR status[200];
+    _stprintf_s(status, _T("总分: %d | 语文:%d 数学:%d 英语:%d 理综:%d | 疲劳: %d/100"),
+        game.totalScore, game.subjectScore[CHINESE], game.subjectScore[MATH],
+        game.subjectScore[ENGLISH], game.subjectScore[SCIENCE], game.fatigue);
+    DrawUIText(50, 50, status, 20, WHITE);
+
+    // 事件提示
+    setfillcolor(RGBA(255, 255, 255, 200));
+    solidrectangle(80, 280, 720, 330);
+    DrawUIText(100, 295, game.eventText.c_str(), 22, BLACK);
+}
+
+void DrawExam() {
+    if (g_imgExamBg.getwidth() != 0) putimage(0, 0, &g_imgExamBg);
+    else setbkcolor(WHITE);
+
+    setbkmode(TRANSPARENT);
+    LPCTSTR title = game.finalExamTriggered ? _T("高 考 考 场") : _T("月 考 考 场");
+    DrawUIText(300, 30, title, 36, BLACK);
+
+    DrawUIText(100, 150, game.currentQuestion.title.c_str(), 24, BLACK);
+
+    TCHAR timeText[50];
+    _stprintf_s(timeText, _T("剩余时间：%d秒"), game.answerTimeLeft);
+    DrawUIText(600, 150, timeText, 24, (game.answerTimeLeft <= 5 ? RED : BLACK));
+
+    for (int i = 0; i < 4; i++) {
+        DrawButton(areaOption[i], WHITE, RGB(255, 255, 100));
+        wstring optText = areaOption[i].text + game.currentQuestion.options[i];
+        COLORREF txtCol = areaOption[i].isHover ? RED : BLACK;
+        DrawUIText(areaOption[i].x + 20, areaOption[i].y + 15, optText.c_str(), 20, txtCol);
+    }
+}
+
+void DrawVolunteer() {
+    if (g_imgVolunteerBg.getwidth() != 0) putimage(0, 0, &g_imgVolunteerBg);
+    else setbkcolor(WHITE);
+
+    setbkmode(TRANSPARENT);
+    DrawUIText(250, 30, _T("高考志愿填报系统"), 36, BLACK);
+
+    TCHAR finalScore[50];
+    _stprintf_s(finalScore, _T("你的高考最终成绩：%d 分"), game.totalScore);
+    DrawUIText(250, 100, finalScore, 28, RED);
+    DrawUIText(200, 160, _T("请选择你要填报的第一志愿（分数不够会滑档调剂）："), 20, BLACK);
+
+    for (int i = 0; i < 7; i++) {
+        bool avail = true;
+        if (i == 0 && game.totalScore < 680) avail = false;
+        else if (i == 1 && game.totalScore < 600) avail = false;
+        else if (i == 2 && game.totalScore < 550) avail = false;
+        else if (i == 3 && game.totalScore < 500) avail = false;
+        else if (i == 4 && game.totalScore < 400) avail = false;
+        else if (i == 5 && game.totalScore < 200) avail = false;
+        areaVolunteer[i].isEnable = avail;
+
+        COLORREF col = avail ? (areaVolunteer[i].isHover ? RGB(200, 230, 255) : WHITE) : LIGHTGRAY;
+        setfillcolor(col);
+        fillrectangle(areaVolunteer[i].x, areaVolunteer[i].y, areaVolunteer[i].x + areaVolunteer[i].width, areaVolunteer[i].y + areaVolunteer[i].height);
+        setlinecolor((areaVolunteer[i].isHover && avail) ? BLUE : BLACK);
+        rectangle(areaVolunteer[i].x, areaVolunteer[i].y, areaVolunteer[i].x + areaVolunteer[i].width, areaVolunteer[i].y + areaVolunteer[i].height);
+
+        settextcolor(avail ? BLACK : DARKGRAY);
+        setbkmode(TRANSPARENT);
+        settextstyle(20, 0, _T("宋体"));
+        int tx = areaVolunteer[i].x + (areaVolunteer[i].width - textwidth(areaVolunteer[i].text.c_str())) / 2;
+        int ty = areaVolunteer[i].y + 10;
+        outtextxy(tx, ty, areaVolunteer[i].text.c_str());
+    }
+}
+
+void DrawEnding() {
+    setbkcolor(WHITE);
+    cleardevice();
+
+    setfillcolor(RGBA(255, 255, 255, 240));
+    fillrectangle(100, 150, 700, 600);
+    setlinecolor(BLACK); rectangle(100, 150, 700, 600);
+
+    setbkmode(TRANSPARENT);
+    DrawUIText(300, 180, _T("录取结果公布！"), 30, BLACK);
+
+    settextstyle(20, 0, _T("宋体")); settextcolor(BLACK);
+    int y = 230;
+    wstring line;
+    for (wchar_t c : game.resultText) {
+        if (c == L'\n') {
+            outtextxy(150, y, line.c_str()); line.clear(); y += 30;
+        }
+        else line += c;
+    }
+    outtextxy(150, y, line.c_str());
+
+    DrawUIText(300, 560, _T("点击任意位置重新开始游戏"), 18, DARKGRAY);
+}
+
+// ===================== 工具函数实现 =====================
+void DrawButton(ClickArea& btn, COLORREF normalCol, COLORREF hoverCol) {
+    setfillcolor(btn.isHover ? hoverCol : normalCol);
+    fillrectangle(btn.x, btn.y, btn.x + btn.width, btn.y + btn.height);
+    setlinecolor(btn.isHover ? RED : BLACK);
+    setlinestyle(PS_SOLID, btn.isHover ? 3 : 1);
+    rectangle(btn.x, btn.y, btn.x + btn.width, btn.y + btn.height);
+    setlinestyle(PS_SOLID, 1);
+}
+
+void DrawUIText(int x, int y, LPCTSTR str, int size, COLORREF color) {
+    settextcolor(color);
+    settextstyle(size, 0, _T("宋体"));
+    setbkmode(TRANSPARENT);
+    outtextxy(x, y, str);
+}
+
+void ResetAllHoverState() {
+    areaBook.isHover = areaBlackboard.isHover = areaPhone.isHover = false;
+    for (int i = 0; i < 4; i++) areaOption[i].isHover = false, areaOption[i].isEnable = true;
+    for (int i = 0; i < 7; i++) areaVolunteer[i].isHover = false, areaVolunteer[i].isEnable = true;
+}
+
+void UpdateHoverState(int x, int y) {
+    ResetAllHoverState();
+    if (game.currentScene == SCENE_CLASSROOM) {
+        areaBook.isHover = (x >= areaBook.x && x <= areaBook.x + areaBook.width && y >= areaBook.y && y <= areaBook.y + areaBook.height && areaBook.isEnable);
+        areaBlackboard.isHover = (x >= areaBlackboard.x && x <= areaBlackboard.x + areaBlackboard.width && y >= areaBlackboard.y && y <= areaBlackboard.y + areaBlackboard.height && areaBlackboard.isEnable);
+        areaPhone.isHover = (x >= areaPhone.x && x <= areaPhone.x + areaPhone.width && y >= areaPhone.y && y <= areaPhone.y + areaPhone.height && areaPhone.isEnable);
+    }
+    else if (game.currentScene == SCENE_EXAM) {
+        for (int i = 0; i < 4; i++) areaOption[i].isHover = (x >= areaOption[i].x && x <= areaOption[i].x + areaOption[i].width && y >= areaOption[i].y && y <= areaOption[i].y + areaOption[i].height && areaOption[i].isEnable);
+    }
+    else if (game.currentScene == SCENE_VOLUNTEER) {
+        for (int i = 0; i < 7; i++) areaVolunteer[i].isHover = (x >= areaVolunteer[i].x && x <= areaVolunteer[i].x + areaVolunteer[i].width && y >= areaVolunteer[i].y && y <= areaVolunteer[i].y + areaVolunteer[i].height && areaVolunteer[i].isEnable);
+    }
+}
+
+void HandleMouseClick(int x, int y) {
+    if (game.currentScene == SCENE_ENDING) { RestartGame(); return; }
+
+    if (game.currentScene == SCENE_EXAM) {
+        for (int i = 0; i < 4; i++) {
+            bool click = (x >= areaOption[i].x && x <= areaOption[i].x + areaOption[i].width && y >= areaOption[i].y && y <= areaOption[i].y + areaOption[i].height && areaOption[i].isEnable);
+            if (click) {
+                // 答对加分逻辑
+                if (i == game.currentQuestion.correctIndex) {
+                    int add = 10;
+                    if (game.day == 10 || game.day == 20) add = 15;
+                    if (game.finalExamTriggered) add = 20;
+                    game.subjectScore[game.currentQuestion.subject] += add;
+                    game.subjectScore[game.currentQuestion.subject] = min(150, game.subjectScore[game.currentQuestion.subject]);
+                    UpdateTotalScore();
+                    game.eventText = L"答题正确！+" + to_wstring(add) + L"分";
+                }
+                // 答错处理
+                else {
+                    game.eventText = L"答错了！本次答题无加分";
+                }
+
+                // 【核心修复】高考结束直接进志愿填报，不再回教室、不涨天数
+                if (game.finalExamTriggered) {
+                    game.currentScene = SCENE_VOLUNTEER;
+                }
+                else {
+                    game.currentScene = SCENE_CLASSROOM;
+                    if (game.day < MAX_GAME_DAY) game.day++;
+                }
+                return;
+            }
+        }
+        return;
+    }
+
+    if (game.currentScene == SCENE_CLASSROOM) {
+        if (game.isPlayingHideGame) {
+            bool clickPhone = (x >= areaPhone.x && x <= areaPhone.x + areaPhone.width && y >= areaPhone.y && y <= areaPhone.y + areaPhone.height);
+            if (clickPhone) {
+                game.eventText = game.teacherIsComing ? L"成功躲过班主任！疲劳-30" : L"虚惊一场！疲劳-20";
+                game.fatigue -= game.teacherIsComing ? 30 : 20;
+                game.fatigue = max(0, game.fatigue);
+                game.isPlayingHideGame = false;
+                if (game.day < MAX_GAME_DAY) game.day++;
+            }
+            return;
+        }
+
+        // 点击课本刷题
+        if (areaBook.isHover) {
+            GenerateRandomQuestion();
+            game.currentScene = SCENE_EXAM;
+            game.answerTimeLeft = 15;
+            game.eventText = L"开始刷题！15秒内答对加分";
+            game.fatigue += 20;
+        }
+        // 点击黑板听课
+        else if (areaBlackboard.isHover) {
+            for (int i = 0; i < SUBJECT_COUNT; i++) game.subjectScore[i] = min(150, game.subjectScore[i] + 5);
+            UpdateTotalScore(); game.fatigue += 10;
+            game.eventText = L"认真听完了一节课，全科目+5分！";
+            if (game.day < MAX_GAME_DAY) game.day++;
+        }
+        // 点击手机摸鱼
+        else if (areaPhone.isHover) {
+            if (rand() % 10 < 5) {
+                game.isPlayingHideGame = true; game.hideGameTimer = 3;
+                game.teacherIsComing = (rand() % 10 < 5);
+                game.eventText = L"班主任正在后门巡逻！3秒内再次点击手机藏起来！";
+            }
+            else {
+                game.fatigue -= 30; game.fatigue = max(0, game.fatigue);
+                game.eventText = L"偷偷玩了会儿手机，精神多了！疲劳-30";
+                if (game.day < MAX_GAME_DAY) game.day++;
+            }
+        }
+
+        // 疲劳满了强制休息
+        if (game.fatigue >= 100) {
+            game.fatigue = 50;
+            game.eventText = L"你太累了，直接趴在课桌上睡了一整天！";
+            if (game.day < MAX_GAME_DAY) game.day++;
+        }
+
+        // 随机事件
+        if (rand() % 10 < 3 && !game.isPlayingHideGame) {
+            RandomEvent();
+        }
+
+        // 月考触发
+        if ((game.day == 10 || game.day == 20) && game.currentScene == SCENE_CLASSROOM && !game.isAnswering) {
+            StartMonthlyExam();
+        }
+
+        // 【修复】高考仅触发一次
+        if (game.day == MAX_GAME_DAY && !game.finalExamTriggered && game.currentScene == SCENE_CLASSROOM) {
+            StartFinalExam();
+            game.finalExamTriggered = true;
+        }
+
+        // 数值边界保护
+        game.totalScore = max(0, min(750, game.totalScore));
+        game.fatigue = max(0, min(100, game.fatigue));
+    }
+
+    if (game.currentScene == SCENE_VOLUNTEER) {
+        for (int i = 0; i < 7; i++) {
+            if (areaVolunteer[i].isHover && areaVolunteer[i].isEnable) {
+                game.volunteerChoice = i; GenerateResult();
+                game.currentScene = SCENE_ENDING; return;
+            }
+        }
+    }
+}
+
+void RandomEvent() {
+    int id = rand() % 11;
+    switch (id) {
+    case 0: game.eventText = L"体育老师生病，这节课上数学！\n数学+15，疲劳+15"; game.subjectScore[MATH] += 15; game.fatigue += 15; break;
+    case 1: game.eventText = L"同桌塞给你一份学霸笔记！\n全学科+10"; for (int i = 0; i < 4; i++)game.subjectScore[i] += 10; break;
+    case 2: game.eventText = L"班主任在后门偷看你！\n被抓现行，批评教育\n疲劳+20"; game.fatigue += 20; break;
+    case 3: game.eventText = L"李华让你帮他写英语作文！\n英语+15，疲劳+10"; game.subjectScore[ENGLISH] += 15; game.fatigue += 10; break;
+    case 4: game.eventText = L"考试前一天你发烧了！\n发挥失常，总分-20"; game.totalScore -= 20; break;
+    case 5: game.eventText = L"老师：\"这道题我讲过多少遍了！\"\n你突然就懂了，全科目+5"; for (int i = 0; i < 4; i++)game.subjectScore[i] += 5; break;
+    case 6: game.eventText = L"妈妈给你炖了爱心鸡汤！\n疲劳-20"; game.fatigue -= 20; break;
+    case 7: game.eventText = L"上课睡觉被老师点名！\n尴尬到抠脚，疲劳+15"; game.fatigue += 15; break;
+    case 8: game.eventText = L"模考中超常发挥！\n总分+25"; game.totalScore += 25; break;
+    case 9: game.eventText = L"和同桌吵架了，心情很差\n疲劳+25，总分-10"; game.fatigue += 25; game.totalScore -= 10; break;
+    case 10: game.eventText = L"参加学科竞赛获得一等奖！\n对应科目+30"; game.subjectScore[rand() % 4] += 30; break;
+    }
+    UpdateTotalScore();
+    game.fatigue = max(0, min(100, game.fatigue));
+}
+
+void GenerateRandomQuestion() {
+    int idx = rand() % questionBank.size();
+    game.currentQuestion = questionBank[idx];
+}
+
+void StartMonthlyExam() {
+    GenerateRandomQuestion();
+    game.currentScene = SCENE_EXAM;
+    game.answerTimeLeft = 20;
+    game.eventText = L"月考开始了！20秒内答对题目获得大量加分";
+}
+
+void StartFinalExam() {
+    GenerateRandomQuestion();
+    game.currentScene = SCENE_EXAM;
+    game.answerTimeLeft = 30;
+    game.eventText = L"高考最终场！30秒内答对题目决定你的最终分数";
+}
+
+void UpdateTotalScore() {
+    game.totalScore = 0;
+    for (int i = 0; i < SUBJECT_COUNT; i++) {
+        game.subjectScore[i] = min(150, game.subjectScore[i]);
+        game.totalScore += game.subjectScore[i];
+    }
+    game.totalScore = max(0, min(750, game.totalScore));
+    // 锁定天数上限，绝对不会超过30
+    game.day = min(MAX_GAME_DAY, game.day);
+}
+
+void GenerateResult() {
+    int score = game.totalScore;
+    int choice = game.volunteerChoice;
+
+    if (choice == 6) {
+        game.resultText = L"你决定复读一年！\n\n这一年你戒掉了手机，发奋图强，\n终于在第二年考上了理想的大学！";
+        return;
+    }
+
+    bool slip = false;
+    if (choice == 0 && score < 700) slip = true;
+    else if (choice == 1 && score < 620) slip = true;
+    else if (choice == 2 && score < 570) slip = true;
+    else if (choice == 3 && score < 520) slip = true;
+    else if (choice == 4 && score < 420) slip = true;
+    else if (choice == 5 && score < 220) slip = true;
+
+    if (slip) {
+        if (choice == 0) choice = 1; else if (choice == 1) choice = 2;
+        else if (choice == 2) choice = 3; else if (choice == 3) choice = 4;
+        else if (choice == 4) choice = 5;
+        else { game.resultText = L"很遗憾，你填报的所有志愿都滑档了！\n\n你决定先去社会上闯荡，\n几年后创办了自己的科技公司！"; return; }
+        game.resultText = L"⚠️ 第一志愿滑档了！你被调剂到了：\n\n";
+    }
+    else {
+        game.resultText = L"🎉 恭喜你！成功被录取！\n\n录取院校：\n\n";
+    }
+
+    switch (choice) {
+    case 0: game.resultText += score >= 730 ? L"清华大学（全省理科状元）\n\n你成为了全省高考状元！" : L"北京大学\n\n你在燕园度过了美好的四年。"; break;
+    case 1: game.resultText += L"某985工程大学\n\n你在大学里成绩优异，获得保研资格。"; break;
+    case 2: game.resultText += L"某211工程大学\n\n你在大学里担任学生会主席，毕业后考上了公务员。"; break;
+    case 3: game.resultText += L"某普通一本大学\n\n你在大学里谈了一场甜甜的恋爱。"; break;
+    case 4: game.resultText += L"某民办本科大学\n\n你在大学里努力学习专业技能。"; break;
+    case 5: game.resultText += L"蓝翔技工学校\n\n你学习了挖掘机专业，月薪过万！"; break;
+    }
+    if (slip) game.resultText += L"\n\n虽然第一志愿没考上，\n但这也是一个不错的结果！\n是金子在哪里都会发光的✨";
+}
+
+void RestartGame() {
+    InitGame();
+}
