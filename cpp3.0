@@ -1,0 +1,481 @@
+#define _CRT_SECURE_NO_WARNINGS
+#ifndef RGBA
+#define RGBA(r,g,b,a) ((COLORREF)(((BYTE)(r)|((WORD)((BYTE)(g))<<8))|(((DWORD)(BYTE)(b))<<16)|(((DWORD)(BYTE)(a))<<24)))
+#endif
+
+#include <graphics.h>
+#include <conio.h>
+#include <windows.h>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+// ===================== 核心配置 =====================
+#define RES_CLASSROOM_BG   _T("res/bg_classroom.jpg")
+#define RES_EXAM_BG        _T("res/bg_exam.jpg")
+#define RES_VOLUNTEER_BG   _T("res/bg_volunteer.jpg")
+const int MAX_GAME_DAY = 30;
+
+// ===================== 枚举 =====================
+enum Scene { SCENE_CLASSROOM, SCENE_EXAM, SCENE_VOLUNTEER, SCENE_ENDING };
+enum Subject { CHINESE, MATH, ENGLISH, SCIENCE, SUBJECT_COUNT };
+enum DayPhase { PHASE_MORNING, PHASE_AFTERNOON, PHASE_NIGHT, PHASE_DAY_END };
+
+// ===================== 结构体 =====================
+struct Question {
+    wstring title;
+    wstring options[4];
+    int correctIndex;
+    Subject subject;
+};
+
+struct ClickArea {
+    int x, y, w, h;
+    wstring text;
+    bool hover, enable;
+};
+
+struct GameState {
+    int day;
+    int subject[SUBJECT_COUNT];
+    int total;
+    int fatigue;
+    Scene scene;
+    DayPhase phase;
+
+    bool examTriggered;
+    bool unlockWrongBook, unlockTeacher, unlockExamPaper;
+
+    wstring event;
+    wstring result;
+    int mx, my;
+
+    bool answering;
+    Question q;
+    int timeLeft;
+    bool hideGame;
+    int hideTimer;
+    bool teacherComing;
+};
+
+// ===================== 全局变量 =====================
+GameState g;
+vector<Question> bank;
+IMAGE imgClass, imgExam, imgVol;
+
+ClickArea aMorning[] = {
+    {150,300,200,70, L"早读背诵",0,1},
+    {420,300,200,70, L"认真听课",0,1},
+    {150,400,200,70, L"上课睡觉",0,1},
+};
+
+ClickArea aAfternoon[] = {
+    {150,300,200,70, L"专项刷题",0,1},
+    {420,300,200,70, L"操场散步",0,1},
+    {150,400,200,70, L"问老师问题",0,0},
+};
+
+ClickArea aNight[] = {
+    {150,300,200,70, L"错题复盘",0,0},
+    {420,300,200,70, L"熬夜刷题",0,1},
+    {150,400,200,70, L"早点休息",0,1},
+};
+
+// ===================== 函数声明 =====================
+void init(); void res(); void qBank();
+void draw(); void drawClass(); void drawExam(); void drawVol(); void drawEnd();
+void btn(ClickArea& b, COLORREF n, COLORREF h);
+void text(int x, int y, LPCWSTR s, int h, COLORREF c);
+void mouse(int x, int y); void hover(int x, int y);
+void randEvent(); void nextPhase();
+void genQ(); void startExam(); void finalExam();
+void calTotal(); void genEnd(); void restart();
+
+// ===================== 主函数 =====================
+int main() {
+    initgraph(800, 650);
+    BeginBatchDraw();
+    res(); qBank(); init();
+
+    while (true) {
+        POINT p; GetCursorPos(&p); ScreenToClient(GetHWnd(), &p);
+        g.mx = p.x; g.my = p.y;
+        hover(g.mx, g.my);
+
+        draw(); FlushBatchDraw();
+
+        if (g.scene == SCENE_EXAM && g.timeLeft > 0) {
+            static int t = 0;
+            if (++t >= 100) { t = 0; g.timeLeft--; }
+            if (g.timeLeft <= 0) {
+                g.event = L"答题超时！";
+                g.scene = SCENE_CLASSROOM;
+            }
+        }
+
+        if (MouseHit()) {
+            MOUSEMSG m = GetMouseMsg();
+            if (m.uMsg == WM_LBUTTONDOWN) mouse(m.x, m.y);
+        }
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break;
+        Sleep(10);
+    }
+    closegraph();
+    return 0;
+}
+
+// ===================== 初始化 =====================
+void res() {
+    loadimage(&imgClass, RES_CLASSROOM_BG, 800, 650);
+    loadimage(&imgExam, RES_EXAM_BG, 800, 650);
+    loadimage(&imgVol, RES_VOLUNTEER_BG, 800, 650);
+}
+
+void qBank() {
+    bank.push_back({ L"鲁迅原名？", {L"周树人",L"周作人",L"周建人",L"周恩来"}, 0, CHINESE });
+    bank.push_back({ L"1+2*3=？", {L"9",L"7",L"10",L"8"}, 1, MATH });
+    bank.push_back({ L"元音字母？", {L"B",L"C",L"A",L"D"}, 2, ENGLISH });
+    bank.push_back({ L"水化学式？", {L"H2O",L"CO2",L"O2",L"H2"}, 0, SCIENCE });
+    bank.push_back({ L"《静夜思》作者？", {L"杜甫",L"李白",L"白居易",L"王维"},1,CHINESE });
+}
+
+void init() {
+    srand(time(0));
+    g.day = 1;
+    for (int i = 0; i < 4; i++) g.subject[i] = 80;
+    g.total = 0; calTotal();
+    g.fatigue = 0;
+    g.scene = SCENE_CLASSROOM;
+    g.phase = PHASE_MORNING;
+    g.examTriggered = false;
+    g.event = L"高三开学！每天分上午/下午/晚自修三段行动！";
+    g.unlockWrongBook = false;
+    g.unlockTeacher = false;
+    g.unlockExamPaper = false;
+}
+
+// ===================== 绘制 =====================
+void draw() {
+    cleardevice();
+    if (g.scene == SCENE_CLASSROOM) drawClass();
+    if (g.scene == SCENE_EXAM) drawExam();
+    if (g.scene == SCENE_VOLUNTEER) drawVol();
+    if (g.scene == SCENE_ENDING) drawEnd();
+}
+
+void text(int x, int y, LPCWSTR s, int h, COLORREF c) {
+    settextcolor(c);
+    settextstyle(h, 0, L"微软雅黑");
+    setbkmode(TRANSPARENT);
+    outtextxy(x, y, s);
+}
+
+void btn(ClickArea& b, COLORREF n, COLORREF h) {
+    setfillcolor(b.hover ? h : n);
+    solidrectangle(b.x, b.y, b.x + b.w, b.y + b.h);
+    setlinecolor(b.hover ? RED : BLACK);
+    rectangle(b.x, b.y, b.x + b.w, b.y + b.h);
+    text(b.x + 15, b.y + 15, b.text.c_str(), 22, b.hover ? BLUE : BLACK);
+}
+
+void drawClass() {
+    if (imgClass) putimage(0, 0, &imgClass);
+    else { setbkcolor(WHITE); cleardevice(); }
+
+    wchar_t dayBuf[30];
+    int left = max(0, MAX_GAME_DAY - g.day + 1);
+    swprintf(dayBuf, L"倒计时：%d天", left);
+    text(320, 80, dayBuf, 28, BLACK);
+
+    setfillcolor(RGBA(0, 0, 0, 160));
+    solidrectangle(30, 500, 770, 620);
+    wchar_t info[200];
+    swprintf(info, L"总分:%d | 语文:%d 数学:%d 英语:%d 理综:%d | 疲劳:%d/100",
+        g.total, g.subject[0], g.subject[1], g.subject[2], g.subject[3], g.fatigue);
+    text(40, 510, info, 20, WHITE);
+
+    text(40, 180, g.event.c_str(), 22, RED);
+
+    const wchar_t* phaseName[] = { L"上午", L"下午", "晚自修", L"今日结束" };
+    wchar_t ph[20]; swprintf(ph, L"当前时段：%s", phaseName[g.phase]);
+    text(40, 120, ph, 24, BLUE);
+
+    if (g.phase == PHASE_MORNING) {
+        btn(aMorning[0], RGB(255,250,240), RGB(255,220,150));
+        btn(aMorning[1], RGB(255,250,240), RGB(255,220,150));
+        btn(aMorning[2], RGB(240,240,240), RGB(220,220,220));
+    }
+    if (g.phase == PHASE_AFTERNOON) {
+        aAfternoon[2].enable = g.unlockTeacher;
+        btn(aAfternoon[0], RGB(255,250,240), RGB(255,220,150));
+        btn(aAfternoon[1], RGB(240,245,255), RGB(200,220,255));
+        btn(aAfternoon[2], g.unlockTeacher ? RGB(245,250,240) : LIGHTGRAY, RGB(200,255,200));
+    }
+    if (g.phase == PHASE_NIGHT) {
+        aNight[0].enable = g.unlockWrongBook;
+        btn(aNight[0], g.unlockWrongBook ? RGB(250,245,255) : LIGHTGRAY, RGB(220,200,255));
+        btn(aNight[1], RGB(255,240,240), RGB(255,200,200));
+        btn(aNight[2], RGB(240,255,240), RGB(200,255,200));
+    }
+}
+
+void drawExam() {
+    if (imgExam) putimage(0, 0, &imgExam);
+    text(280, 40, L"答 题 时 间", 32, BLACK);
+    text(100, 150, g.q.title.c_str(), 24, BLACK);
+
+    wchar_t t[20]; swprintf(t, L"时间：%d", g.timeLeft);
+    text(620, 150, t, 24, RED);
+
+    ClickArea opt[4] = {
+        {120,300,520,60,L"A.",0,1},
+        {120,380,520,60,L"B.",0,1},
+        {120,460,520,60,L"C.",0,1},
+        {120,540,520,60,L"D.",0,1},
+    };
+    for (int i = 0; i < 4; i++) {
+        btn(opt[i], WHITE, RGB(255, 255, 150));
+        wstring s = opt[i].text + g.q.options[i];
+        text(opt[i].x + 20, opt[i].y + 15, s.c_str(), 22, BLACK);
+    }
+}
+
+void drawVol() {
+    setbkcolor(WHITE); cleardevice();
+    text(250, 50, L"高考志愿填报", 32, BLACK);
+    wchar_t sc[30]; swprintf(sc, L"总分：%d", g.total);
+    text(330, 120, sc, 28, RED);
+
+    ClickArea sch[7] = {
+        {200,200,400,50,L"清华/北大 (需680+)",0,1},
+        {200,260,400,50,L"985大学 (需600+)",0,1},
+        {200,320,400,50,L"211大学 (需550+)",0,1},
+        {200,380,400,50,L"一本 (需500+)",0,1},
+        {200,440,400,50,L"本科 (需400+)",0,1},
+        {200,500,400,50,L"专科 (需200+)",0,1},
+        {200,560,400,50,L"复读一年",0,1},
+    };
+    for (int i = 0; i < 7; i++) {
+        bool ok = true;
+        if (i == 0 && g.total < 680) ok = 0;
+        if (i == 1 && g.total < 600) ok = 0;
+        if (i == 2 && g.total < 550) ok = 0;
+        if (i == 3 && g.total < 500) ok = 0;
+        if (i == 4 && g.total < 400) ok = 0;
+        if (i == 5 && g.total < 200) ok = 0;
+        btn(sch[i], ok ? WHITE : LIGHTGRAY, ok ? RGB(220,240,255) : LIGHTGRAY);
+    }
+}
+
+void drawEnd() {
+    setbkcolor(WHITE); cleardevice();
+    text(280, 80, L"录取结果", 32, BLACK);
+    text(100, 180, g.result.c_str(), 24, BLACK);
+    text(250, 550, L"点击任意处重新开始", 20, DARKGRAY);
+}
+
+// ===================== 逻辑 =====================
+void hover(int x, int y) {
+    for (auto& a : aMorning) a.hover = 0;
+    for (auto& a : aAfternoon) a.hover = 0;
+    for (auto& a : aNight) a.hover = 0;
+
+    auto in = [&](ClickArea& b) {
+        return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h && b.enable;
+    };
+
+    if (g.phase == PHASE_MORNING) {
+        if (in(aMorning[0])) aMorning[0].hover = 1;
+        if (in(aMorning[1])) aMorning[1].hover = 1;
+        if (in(aMorning[2])) aMorning[2].hover = 1;
+    }
+    if (g.phase == PHASE_AFTERNOON) {
+        if (in(aAfternoon[0])) aAfternoon[0].hover = 1;
+        if (in(aAfternoon[1])) aAfternoon[1].hover = 1;
+        if (in(aAfternoon[2])) aAfternoon[2].hover = 1;
+    }
+    if (g.phase == PHASE_NIGHT) {
+        if (in(aNight[0])) aNight[0].hover = 1;
+        if (in(aNight[1])) aNight[1].hover = 1;
+        if (in(aNight[2])) aNight[2].hover = 1;
+    }
+}
+
+void nextPhase() {
+    if (g.phase == PHASE_MORNING) {
+        g.phase = PHASE_AFTERNOON;
+        g.event = L"进入下午时段！";
+    }
+    else if (g.phase == PHASE_AFTERNOON) {
+        g.phase = PHASE_NIGHT;
+        g.event = L"进入晚自修！";
+    }
+    else if (g.phase == PHASE_NIGHT) {
+        g.phase = PHASE_MORNING;
+        g.day++;
+        g.event = L"一天结束！新的一天开始！";
+
+        if (g.day >= 5) g.unlockWrongBook = 1;
+        if (g.day >= 10) g.unlockTeacher = 1;
+        if (g.day >= 20) g.unlockExamPaper = 1;
+    }
+
+    if (g.day >= MAX_GAME_DAY && !g.examTriggered) {
+        g.examTriggered = 1;
+        g.scene = SCENE_EXAM;
+        g.timeLeft = 30;
+        genQ();
+    }
+}
+
+void mouse(int x, int y) {
+    if (g.scene == SCENE_ENDING) { restart(); return; }
+    if (g.scene == SCENE_EXAM) {
+        ClickArea opt[4] = {
+            {120,300,520,60}, {120,380,520,60},
+            {120,460,520,60}, {120,540,520,60}
+        };
+        for (int i = 0; i < 4; i++) {
+            if (x >= opt[i].x && x <= opt[i].x + opt[i].w &&
+                y >= opt[i].y && y <= opt[i].y + opt[i].h) {
+                if (i == g.q.correctIndex) {
+                    g.subject[g.q.subject] += 20;
+                    g.subject[g.q.subject] = min(150, g.subject[g.q.subject]);
+                    calTotal();
+                    g.event = L"答对！+20分！";
+                }
+                else g.event = L"答错了！";
+
+                if (g.examTriggered) {
+                    g.scene = SCENE_VOLUNTEER;
+                } else {
+                    g.scene = SCENE_CLASSROOM;
+                    nextPhase();
+                }
+                return;
+            }
+        }
+    }
+
+    if (g.scene == SCENE_CLASSROOM) {
+        auto act = [&](ClickArea& b) {
+            return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h && b.enable;
+        };
+
+        if (g.phase == PHASE_MORNING) {
+            if (act(aMorning[0])) {
+                g.subject[0] += 8; g.subject[2] += 8; calTotal();
+                g.fatigue += 5;
+                g.event = L"早读完成！语文英语+8分！";
+                nextPhase();
+            }
+            else if (act(aMorning[1])) {
+                for (int i = 0; i < 4; i++) g.subject[i] += 5; calTotal();
+                g.fatigue += 10;
+                g.event = L"认真听课！全科+5分！";
+                nextPhase();
+            }
+            else if (act(aMorning[2])) {
+                g.fatigue -= 20;
+                g.event = L"上课睡觉！疲劳-20！";
+                nextPhase();
+            }
+        }
+
+        if (g.phase == PHASE_AFTERNOON) {
+            if (act(aAfternoon[0])) {
+                g.subject[rand() % 4] += 15; calTotal();
+                g.fatigue += 20;
+                g.event = L"刷题完成！单科+15！";
+                nextPhase();
+            }
+            else if (act(aAfternoon[1])) {
+                g.fatigue -= 25;
+                g.event = L"散步放松！疲劳-25！";
+                nextPhase();
+            }
+            else if (act(aAfternoon[2])) {
+                int m = 0;
+                for (int i = 1; i < 4; i++)
+                    if (g.subject[i] < g.subject[m]) m = i;
+                g.subject[m] += 20; calTotal();
+                g.fatigue += 15;
+                g.event = L"问老师！最弱科目+20！";
+                nextPhase();
+            }
+        }
+
+        if (g.phase == PHASE_NIGHT) {
+            if (act(aNight[0]) && g.unlockWrongBook) {
+                for (int i = 0; i < 4; i++) g.subject[i] += 8; calTotal();
+                g.fatigue += 10;
+                g.event = L"错题复盘！全科+8！";
+                nextPhase();
+            }
+            else if (act(aNight[1])) {
+                for (int i = 0; i < 4; i++) g.subject[i] += 10; calTotal();
+                g.fatigue += 35;
+                g.event = L"熬夜刷题！全科+10！但非常累！";
+                nextPhase();
+            }
+            else if (act(aNight[2])) {
+                g.fatigue = max(0, g.fatigue - 30);
+                g.event = L"早点休息！疲劳-30！";
+                nextPhase();
+            }
+        }
+
+        g.fatigue = max(0, min(100, g.fatigue));
+        if (g.fatigue >= 100) {
+            g.fatigue = 60;
+            g.event = L"太累了！强制休息！";
+        }
+    }
+
+    if (g.scene == SCENE_VOLUNTEER) {
+        ClickArea sch[7] = {
+            {200,200,400,50}, {200,260,400,50}, {200,320,400,50},
+            {200,380,400,50}, {200,440,400,50}, {200,500,400,50},
+            {200,560,400,50}
+        };
+        for (int i = 0; i < 7; i++) {
+            if (x >= sch[i].x && x <= sch[i].x + sch[i].w &&
+                y >= sch[i].y && y <= sch[i].y + sch[i].h) {
+                bool ok = true;
+                if (i == 0 && g.total < 680) ok = 0;
+                if (i == 1 && g.total < 600) ok = 0;
+                if (i == 2 && g.total < 550) ok = 0;
+                if (i == 3 && g.total < 500) ok = 0;
+                if (i == 4 && g.total < 400) ok = 0;
+                if (i == 5 && g.total < 200) ok = 0;
+                if (ok || i == 6) {
+                    if (i == 6) g.result = L"你选择复读一年！明年再战！";
+                    else if (i == 0) g.result = L"成功录取清华/北大！人生巅峰！";
+                    else if (i == 1) g.result = L"录取985大学！前途光明！";
+                    else if (i == 2) g.result = L"录取211大学！非常优秀！";
+                    else if (i == 3) g.result = L"录取一本大学！不错的结果！";
+                    else if (i == 4) g.result = L"录取本科！顺利毕业！";
+                    else g.result = L"录取专科！掌握一技之长！";
+                    g.scene = SCENE_ENDING;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void calTotal() {
+    g.total = 0;
+    for (int i = 0; i < 4; i++) {
+        g.subject[i] = min(150, g.subject[i]);
+        g.total += g.subject[i];
+    }
+    g.total = max(0, min(750, g.total));
+}
+
+void genQ() { g.q = bank[rand() % bank.size()]; }
+void restart() { init(); }
