@@ -1,0 +1,590 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <graphics.h>
+#include <conio.h>
+#include <windows.h>
+#include <cstdlib>
+#include <ctime>
+#include <vector>
+using namespace std;
+
+// ===================== 游戏核心配置 =====================
+const int MAX_GAME_DAY = 30;
+const int WINDOW_WIDTH = 800;
+const int WINDOW_HEIGHT = 650;
+
+// ===================== 场景枚举 =====================
+enum Scene {
+    SCENE_CLASSROOM,    // 教室主场景
+    SCENE_EXAM,         // 考试答题场景
+    SCENE_VOLUNTEER,    // 志愿填报场景
+    SCENE_ENDING        // 结局场景
+};
+enum Subject { CHINESE, MATH, ENGLISH, SCIENCE, SUBJECT_COUNT };
+enum DayPhase { PHASE_MORNING, PHASE_AFTERNOON, PHASE_NIGHT };
+
+// ===================== 数据结构体 =====================
+struct Question {
+    char title[100];
+    char options[4][50];
+    int correctIndex;
+    Subject subject;
+};
+
+struct ClickArea {
+    int x, y, w, h;
+    char text[50];
+    bool hover, enable;
+};
+
+struct GameState {
+    int day;
+    int subject[SUBJECT_COUNT];
+    int totalScore;
+    int fatigue;
+    Scene currentScene;
+    DayPhase currentPhase;
+
+    bool examTriggered;
+    bool unlockWrongBook, unlockTeacher;
+
+    char eventText[200];
+    char endText[300];
+    int mouseX, mouseY;
+
+    Question currentQuestion;
+    int examTimeLeft;
+};
+
+// ===================== 全局变量 =====================
+GameState g;
+vector<Question> questionBank;
+IMAGE bgClassroom, bgExam, bgVolunteer;
+
+// 教室场景-上午时段按钮
+ClickArea btnMorning[] = {
+    {100, 300, 180, 70, "早读背诵", 0, 1},
+    {320, 300, 180, 70, "认真听课", 0, 1},
+    {540, 300, 180, 70, "上课睡觉", 0, 1},
+};
+// 教室场景-下午时段按钮
+ClickArea btnAfternoon[] = {
+    {100, 300, 180, 70, "专项刷题", 0, 1},
+    {320, 300, 180, 70, "操场散步", 0, 1},
+    {540, 300, 180, 70, "问老师问题", 0, 0},
+};
+// 教室场景-晚自习时段按钮
+ClickArea btnNight[] = {
+    {100, 300, 180, 70, "错题复盘", 0, 0},
+    {320, 300, 180, 70, "熬夜刷题", 0, 1},
+    {540, 300, 180, 70, "早点休息", 0, 1},
+};
+
+// ===================== 工具函数 =====================
+// 绘制文本
+void drawText(int x, int y, const char* text, int fontSize, COLORREF color) {
+    settextcolor(color);
+    settextstyle(fontSize, 0, "微软雅黑");
+    setbkmode(TRANSPARENT);
+    outtextxy(x, y, text);
+}
+
+// 绘制按钮
+void drawButton(ClickArea& btn, COLORREF normalColor, COLORREF hoverColor) {
+    setfillcolor(btn.hover ? hoverColor : normalColor);
+    solidrectangle(btn.x, btn.y, btn.x + btn.w, btn.y + btn.h);
+    setlinecolor(btn.hover ? RED : BLACK);
+    rectangle(btn.x, btn.y, btn.x + btn.w, btn.y + btn.h);
+    drawText(btn.x + 15, btn.y + 15, btn.text, 22, btn.hover ? BLUE : BLACK);
+}
+
+// ===================== 游戏初始化 =====================
+// 加载背景图片
+void loadResources() {
+    
+    loadimage(&bgClassroom, "D:\\c_code\\高考模拟器\\res\\bg_classroom.jpg", 800, 650);
+    loadimage(&bgExam, "D:\\c_code\\高考模拟器\\res\\bg_exam.jpg", 800, 650);
+    loadimage(&bgVolunteer, "D:\\c_code\\高考模拟器\\res\\bg_volunteer.jpg", 800, 650);
+
+    // 弹出加载结果提示
+    char loadInfo[300];
+    sprintf(loadInfo, "教室背景加载：%s\n考试背景加载：%s\n志愿背景加载：%s",
+        bgClassroom.getwidth() == 800 ? "成功" : "失败",
+        bgExam.getwidth() == 800 ? "成功" : "失败",
+        bgVolunteer.getwidth() == 800 ? "成功" : "失败");
+    MessageBox(NULL, loadInfo, "图片加载结果", MB_OK);
+}
+// 初始化题库
+void initQuestionBank() {
+    questionBank.push_back({ "鲁迅的原名是？", {"周树人", "周作人", "周建人", "周恩来"}, 0, CHINESE });
+    questionBank.push_back({ "1+2*3的计算结果是？", {"9", "7", "10", "8"}, 1, MATH });
+    questionBank.push_back({ "以下哪个是元音字母？", {"B", "C", "A", "D"}, 2, ENGLISH });
+    questionBank.push_back({ "水的化学式是？", {"H2O", "CO2", "O2", "H2"}, 0, SCIENCE });
+    questionBank.push_back({ "《静夜思》的作者是？", {"杜甫", "李白", "白居易", "王维"}, 1, CHINESE });
+}
+
+// 初始化游戏状态
+void initGame() {
+    srand((unsigned int)time(0));
+    g.day = 1;
+    for (int i = 0; i < SUBJECT_COUNT; i++) {
+        g.subject[i] = 80;
+    }
+    g.totalScore = 0;
+    g.fatigue = 0;
+    g.currentScene = SCENE_CLASSROOM;
+    g.currentPhase = PHASE_MORNING;
+    g.examTriggered = false;
+    g.unlockWrongBook = false;
+    g.unlockTeacher = false;
+    strcpy(g.eventText, "高三开学！每天分上午/下午/晚自修三个时段，开启你的高考冲刺！");
+}
+
+// ===================== 场景绘制 =====================
+// 教室主场景绘制
+void drawClassroomScene() {
+    // 先绘制背景图，再绘制文字和按钮，确保文字不被覆盖
+    if (bgClassroom.getwidth() == WINDOW_WIDTH) {
+        putimage(0, 0, &bgClassroom);
+    }
+    else {
+        setbkcolor(WHITE);
+        cleardevice();
+    }
+
+    // 绘制倒计时
+    char dayBuf[50];
+    int remainDay = max(0, MAX_GAME_DAY - g.day + 1);
+    sprintf(dayBuf, "高考倒计时：%d天", remainDay);
+    drawText(300, 80, dayBuf, 28, BLACK);
+
+    // 绘制当前时段
+    const char* phaseName[] = { "上午", "下午", "晚自修" };
+    char phaseBuf[50];
+    sprintf(phaseBuf, "当前时段：%s", phaseName[g.currentPhase]);
+    drawText(50, 120, phaseBuf, 24, BLUE);
+
+    // 绘制事件提示
+    drawText(50, 180, g.eventText, 22, RED);
+
+    // 绘制底部状态栏
+    setfillcolor(RGB(0, 0, 0));
+    solidrectangle(30, 500, 770, 620);
+    char statusBuf[200];
+    sprintf(statusBuf, "总分:%d | 语文:%d 数学:%d 英语:%d 理综:%d | 疲劳:%d/100",
+        g.totalScore, g.subject[0], g.subject[1], g.subject[2], g.subject[3], g.fatigue);
+    drawText(40, 510, statusBuf, 20, WHITE);
+
+    // 绘制对应时段的按钮
+    if (g.currentPhase == PHASE_MORNING) {
+        drawButton(btnMorning[0], RGB(255, 250, 240), RGB(255, 220, 150));
+        drawButton(btnMorning[1], RGB(255, 250, 240), RGB(255, 220, 150));
+        drawButton(btnMorning[2], RGB(240, 240, 240), RGB(220, 220, 220));
+    }
+    if (g.currentPhase == PHASE_AFTERNOON) {
+        btnAfternoon[2].enable = g.unlockTeacher;
+        drawButton(btnAfternoon[0], RGB(255, 250, 240), RGB(255, 220, 150));
+        drawButton(btnAfternoon[1], RGB(240, 245, 255), RGB(200, 220, 255));
+        drawButton(btnAfternoon[2], g.unlockTeacher ? RGB(245, 250, 240) : LIGHTGRAY, RGB(200, 255, 200));
+    }
+    if (g.currentPhase == PHASE_NIGHT) {
+        btnNight[0].enable = g.unlockWrongBook;
+        drawButton(btnNight[0], g.unlockWrongBook ? RGB(250, 245, 255) : LIGHTGRAY, RGB(220, 200, 255));
+        drawButton(btnNight[1], RGB(255, 240, 240), RGB(255, 200, 200));
+        drawButton(btnNight[2], RGB(240, 255, 240), RGB(200, 255, 200));
+    }
+}
+
+// 考试答题场景绘制
+void drawExamScene() {
+    if (bgExam.getwidth() == WINDOW_WIDTH) {
+        putimage(0, 0, &bgExam);
+    }
+    else {
+        setbkcolor(WHITE);
+        cleardevice();
+    }
+
+    drawText(280, 40, "答 题 时 间", 32, BLACK);
+    drawText(100, 150, g.currentQuestion.title, 24, BLACK);
+
+    // 绘制倒计时
+    char timeBuf[50];
+    sprintf(timeBuf, "剩余时间：%d秒", g.examTimeLeft);
+    drawText(600, 150, timeBuf, 24, RED);
+
+    // 绘制选项按钮
+    ClickArea optBtn[4] = {
+        {120,300,520,60,"A.",0,1},
+        {120,380,520,60,"B.",0,1},
+        {120,460,520,60,"C.",0,1},
+        {120,540,520,60,"D.",0,1},
+    };
+    for (int i = 0; i < 4; i++) {
+        drawButton(optBtn[i], WHITE, RGB(255, 255, 150));
+        char buf[100];
+        sprintf(buf, "%s%s", optBtn[i].text, g.currentQuestion.options[i]);
+        drawText(optBtn[i].x + 20, optBtn[i].y + 15, buf, 22, BLACK);
+    }
+}
+
+// 志愿填报场景绘制
+void drawVolunteerScene() {
+    if (bgVolunteer.getwidth() == WINDOW_WIDTH) {
+        putimage(0, 0, &bgVolunteer);
+    }
+    else {
+        setbkcolor(WHITE);
+        cleardevice();
+    }
+
+    drawText(250, 50, "高考志愿填报", 32, BLACK);
+    char scoreBuf[50];
+    sprintf(scoreBuf, "你的高考总分：%d", g.totalScore);
+    drawText(300, 120, scoreBuf, 28, RED);
+
+    // 绘制志愿选项
+    ClickArea schoolBtn[7] = {
+        {200,200,400,50,"清华/北大 (需680+)",0,1},
+        {200,260,400,50,"985大学 (需600+)",0,1},
+        {200,320,400,50,"211大学 (需550+)",0,1},
+        {200,380,400,50,"一本院校 (需500+)",0,1},
+        {200,440,400,50,"本科院校 (需400+)",0,1},
+        {200,500,400,50,"专科院校 (需200+)",0,1},
+        {200,560,400,50,"复读一年",0,1},
+    };
+    for (int i = 0; i < 7; i++) {
+        bool canSelect = true;
+        if (i == 0 && g.totalScore < 680) canSelect = false;
+        if (i == 1 && g.totalScore < 600) canSelect = false;
+        if (i == 2 && g.totalScore < 550) canSelect = false;
+        if (i == 3 && g.totalScore < 500) canSelect = false;
+        if (i == 4 && g.totalScore < 400) canSelect = false;
+        if (i == 5 && g.totalScore < 200) canSelect = false;
+        drawButton(schoolBtn[i], canSelect ? WHITE : LIGHTGRAY, canSelect ? RGB(220, 240, 255) : LIGHTGRAY);
+    }
+}
+
+// 结局场景绘制
+void drawEndingScene() {
+    setbkcolor(WHITE);
+    cleardevice();
+    drawText(280, 80, "录取结果", 32, BLACK);
+    drawText(100, 180, g.endText, 24, BLACK);
+    drawText(250, 550, "点击任意位置重新开始游戏", 20, DARKGRAY);
+}
+
+// 总绘制函数
+void drawGame() {
+    cleardevice();
+    switch (g.currentScene) {
+    case SCENE_CLASSROOM: drawClassroomScene(); break;
+    case SCENE_EXAM: drawExamScene(); break;
+    case SCENE_VOLUNTEER: drawVolunteerScene(); break;
+    case SCENE_ENDING: drawEndingScene(); break;
+    }
+}
+
+// ===================== 游戏逻辑 =====================
+// 按钮悬停检测
+void updateHoverState() {
+    // 重置所有按钮悬停状态
+    for (auto& btn : btnMorning) btn.hover = false;
+    for (auto& btn : btnAfternoon) btn.hover = false;
+    for (auto& btn : btnNight) btn.hover = false;
+
+    // 检测鼠标是否在按钮范围内
+    auto isInBtn = [&](ClickArea& btn) {
+        return g.mouseX >= btn.x && g.mouseX <= btn.x + btn.w
+            && g.mouseY >= btn.y && g.mouseY <= btn.y + btn.h
+            && btn.enable;
+        };
+
+    if (g.currentScene == SCENE_CLASSROOM) {
+        if (g.currentPhase == PHASE_MORNING) {
+            if (isInBtn(btnMorning[0])) btnMorning[0].hover = true;
+            if (isInBtn(btnMorning[1])) btnMorning[1].hover = true;
+            if (isInBtn(btnMorning[2])) btnMorning[2].hover = true;
+        }
+        if (g.currentPhase == PHASE_AFTERNOON) {
+            if (isInBtn(btnAfternoon[0])) btnAfternoon[0].hover = true;
+            if (isInBtn(btnAfternoon[1])) btnAfternoon[1].hover = true;
+            if (isInBtn(btnAfternoon[2])) btnAfternoon[2].hover = true;
+        }
+        if (g.currentPhase == PHASE_NIGHT) {
+            if (isInBtn(btnNight[0])) btnNight[0].hover = true;
+            if (isInBtn(btnNight[1])) btnNight[1].hover = true;
+            if (isInBtn(btnNight[2])) btnNight[2].hover = true;
+        }
+    }
+}
+
+// 切换到下一个时段
+void goToNextPhase() {
+    if (g.currentPhase == PHASE_MORNING) {
+        g.currentPhase = PHASE_AFTERNOON;
+        strcpy(g.eventText, "上午课程结束，进入下午自习时段！");
+    }
+    else if (g.currentPhase == PHASE_AFTERNOON) {
+        g.currentPhase = PHASE_NIGHT;
+        strcpy(g.eventText, "下午自习结束，进入晚自修时段！");
+    }
+    else if (g.currentPhase == PHASE_NIGHT) {
+        g.currentPhase = PHASE_MORNING;
+        g.day++;
+        strcpy(g.eventText, "一天的学习结束，新的一天开始了！");
+
+        // 解锁新功能
+        if (g.day >= 5 && !g.unlockWrongBook) {
+            g.unlockWrongBook = true;
+            strcat(g.eventText, "\n解锁新功能：错题复盘！");
+        }
+        if (g.day >= 10 && !g.unlockTeacher) {
+            g.unlockTeacher = true;
+            strcat(g.eventText, "\n解锁新功能：办公室问老师！");
+        }
+    }
+
+    // 高考触发
+    if (g.day >= MAX_GAME_DAY && !g.examTriggered) {
+        g.examTriggered = true;
+        g.currentScene = SCENE_EXAM;
+        g.examTimeLeft = 30;
+        g.currentQuestion = questionBank[rand() % questionBank.size()];
+    }
+}
+
+// 重新计算总分
+void updateTotalScore() {
+    g.totalScore = 0;
+    for (int i = 0; i < SUBJECT_COUNT; i++) {
+        g.subject[i] = min(150, g.subject[i]);
+        g.totalScore += g.subject[i];
+    }
+    g.totalScore = max(0, min(750, g.totalScore));
+}
+
+// 鼠标点击处理
+void onMouseClick(int x, int y) {
+    // 结局场景点击重新开始
+    if (g.currentScene == SCENE_ENDING) {
+        initGame();
+        return;
+    }
+
+    // 考试场景点击处理
+    if (g.currentScene == SCENE_EXAM) {
+        ClickArea optBtn[4] = {
+            {120,300,520,60}, {120,380,520,60},
+            {120,460,520,60}, {120,540,520,60}
+        };
+        for (int i = 0; i < 4; i++) {
+            if (x >= optBtn[i].x && x <= optBtn[i].x + optBtn[i].w
+                && y >= optBtn[i].y && y <= optBtn[i].y + optBtn[i].h) {
+                // 答对加分
+                if (i == g.currentQuestion.correctIndex) {
+                    g.subject[g.currentQuestion.subject] += 20;
+                    updateTotalScore();
+                    strcpy(g.eventText, "答题正确！+20分！");
+                }
+                else {
+                    strcpy(g.eventText, "答题错误，没有加分！");
+                }
+                // 高考结束进入志愿填报
+                if (g.examTriggered) {
+                    g.currentScene = SCENE_VOLUNTEER;
+                }
+                else {
+                    g.currentScene = SCENE_CLASSROOM;
+                    goToNextPhase();
+                }
+                return;
+            }
+        }
+    }
+
+    // 志愿场景点击处理
+    if (g.currentScene == SCENE_VOLUNTEER) {
+        ClickArea schoolBtn[7] = {
+            {200,200,400,50}, {200,260,400,50}, {200,320,400,50},
+            {200,380,400,50}, {200,440,400,50}, {200,500,400,50},
+            {200,560,400,50}
+        };
+        for (int i = 0; i < 7; i++) {
+            if (x >= schoolBtn[i].x && x <= schoolBtn[i].x + schoolBtn[i].w
+                && y >= schoolBtn[i].y && y <= schoolBtn[i].y + schoolBtn[i].h) {
+                bool canSelect = true;
+                if (i == 0 && g.totalScore < 680) canSelect = false;
+                if (i == 1 && g.totalScore < 600) canSelect = false;
+                if (i == 2 && g.totalScore < 550) canSelect = false;
+                if (i == 3 && g.totalScore < 500) canSelect = false;
+                if (i == 4 && g.totalScore < 400) canSelect = false;
+                if (i == 5 && g.totalScore < 200) canSelect = false;
+
+                if (canSelect || i == 6) {
+                    if (i == 6) strcpy(g.endText, "你选择了复读一年，明年再战高考！");
+                    else if (i == 0) strcpy(g.endText, "恭喜你！成功录取清华大学/北京大学！\n你的努力得到了最好的回报！");
+                    else if (i == 1) strcpy(g.endText, "恭喜你！成功录取985重点院校！\n前途一片光明！");
+                    else if (i == 2) strcpy(g.endText, "恭喜你！成功录取211重点院校！\n非常优秀的结果！");
+                    else if (i == 3) strcpy(g.endText, "恭喜你！成功录取一本院校！\n三年的努力没有白费！");
+                    else if (i == 4) strcpy(g.endText, "恭喜你！成功录取本科院校！\n顺利完成了高中的目标！");
+                    else strcpy(g.endText, "你录取了专科院校，掌握一技之长，未来同样精彩！");
+                    g.currentScene = SCENE_ENDING;
+                    return;
+                }
+            }
+        }
+    }
+
+    // 教室场景点击处理
+    if (g.currentScene == SCENE_CLASSROOM) {
+        auto isClickBtn = [&](ClickArea& btn) {
+            return x >= btn.x && x <= btn.x + btn.w
+                && y >= btn.y && y <= btn.y + btn.h
+                && btn.enable;
+            };
+
+        // 上午时段按钮
+        if (g.currentPhase == PHASE_MORNING) {
+            if (isClickBtn(btnMorning[0])) {
+                g.subject[CHINESE] += 8;
+                g.subject[ENGLISH] += 8;
+                updateTotalScore();
+                g.fatigue += 5;
+                strcpy(g.eventText, "早读完成！语文、英语各+8分！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnMorning[1])) {
+                for (int i = 0; i < SUBJECT_COUNT; i++) g.subject[i] += 5;
+                updateTotalScore();
+                g.fatigue += 10;
+                strcpy(g.eventText, "认真听课！所有科目各+5分！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnMorning[2])) {
+                g.fatigue -= 20;
+                strcpy(g.eventText, "上课睡了一觉，疲劳-20！");
+                goToNextPhase();
+            }
+        }
+
+        // 下午时段按钮
+        if (g.currentPhase == PHASE_AFTERNOON) {
+            if (isClickBtn(btnAfternoon[0])) {
+                g.subject[rand() % SUBJECT_COUNT] += 15;
+                updateTotalScore();
+                g.fatigue += 20;
+                strcpy(g.eventText, "专项刷题完成！单科+15分！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnAfternoon[1])) {
+                g.fatigue -= 25;
+                strcpy(g.eventText, "去操场散了步，疲劳-25！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnAfternoon[2])) {
+                // 找到最弱的科目
+                int minSub = 0;
+                for (int i = 1; i < SUBJECT_COUNT; i++) {
+                    if (g.subject[i] < g.subject[minSub]) minSub = i;
+                }
+                g.subject[minSub] += 20;
+                updateTotalScore();
+                g.fatigue += 15;
+                strcpy(g.eventText, "问了老师问题，最弱科目+20分！");
+                goToNextPhase();
+            }
+        }
+
+        // 晚自习时段按钮
+        if (g.currentPhase == PHASE_NIGHT) {
+            if (isClickBtn(btnNight[0]) && g.unlockWrongBook) {
+                for (int i = 0; i < SUBJECT_COUNT; i++) g.subject[i] += 8;
+                updateTotalScore();
+                g.fatigue += 10;
+                strcpy(g.eventText, "完成错题复盘，所有科目各+8分！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnNight[1])) {
+                for (int i = 0; i < SUBJECT_COUNT; i++) g.subject[i] += 10;
+                updateTotalScore();
+                g.fatigue += 35;
+                strcpy(g.eventText, "熬夜刷了题，所有科目各+10分！但疲劳大幅增加！");
+                goToNextPhase();
+            }
+            else if (isClickBtn(btnNight[2])) {
+                g.fatigue -= 30;
+                strcpy(g.eventText, "早点休息，疲劳-30！");
+                goToNextPhase();
+            }
+        }
+
+        // 疲劳值边界保护
+        g.fatigue = max(0, min(100, g.fatigue));
+        if (g.fatigue >= 100) {
+            g.fatigue = 60;
+            strcpy(g.eventText, "你太累了，强制休息了半天！");
+        }
+    }
+}
+
+// ===================== 主函数 =====================
+int main() {
+    // 创建游戏窗口
+    initgraph(WINDOW_WIDTH, WINDOW_HEIGHT);
+    BeginBatchDraw();
+
+    // 游戏初始化
+    loadResources();
+    initQuestionBank();
+    initGame();
+
+    // 游戏主循环
+    while (true) {
+        // 获取鼠标坐标
+        POINT mousePos;
+        GetCursorPos(&mousePos);
+        ScreenToClient(GetHWnd(), &mousePos);
+        g.mouseX = mousePos.x;
+        g.mouseY = mousePos.y;
+
+        // 更新按钮悬停状态
+        updateHoverState();
+
+        // 考试倒计时更新
+        if (g.currentScene == SCENE_EXAM && g.examTimeLeft > 0) {
+            static int timeCounter = 0;
+            if (++timeCounter >= 100) {
+                timeCounter = 0;
+                g.examTimeLeft--;
+            }
+            if (g.examTimeLeft <= 0) {
+                strcpy(g.eventText, "答题超时！");
+                g.currentScene = SCENE_CLASSROOM;
+            }
+        }
+
+        // 绘制游戏画面
+        drawGame();
+        FlushBatchDraw();
+
+        // 鼠标点击检测
+        if (MouseHit()) {
+            MOUSEMSG msg = GetMouseMsg();
+            if (msg.uMsg == WM_LBUTTONDOWN) {
+                onMouseClick(msg.x, msg.y);
+            }
+        }
+
+        // 退出检测
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            break;
+        }
+
+        Sleep(10);
+    }
+
+    // 关闭窗口
+    EndBatchDraw();
+    closegraph();
+    return 0;
+}
