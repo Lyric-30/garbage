@@ -1,0 +1,757 @@
+#include <graphics.h>
+#include <conio.h>
+#include <time.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+
+#pragma comment(lib, "Winmm.lib")
+
+using std::vector;
+using std::string;
+using std::wstring;
+
+// ==================== 全局常量 ====================
+const int WIDTH = 900;
+const int HEIGHT = 550;
+const int GROUND_Y = 420;
+const int GRAVITY = 1;
+const int JUMP_SPEED = -15;
+const int DOUBLE_JUMP_SPEED = -12;
+const int DASH_SPEED = 40;
+const int MAX_TIME = 120;
+const int BONE_TARGET = 5;
+const float LAND_SPEED = 8.0f;
+
+// ==================== 枚举类型 ====================
+enum GameState { MENU, LAND_LEVEL, VEHICLE_SELECT, WATER_LEVEL, ENDING };
+enum VehicleType { SWIM, SURFBOARD, BOAT };
+enum ObstacleType { ROCK, PIT, STUMP, REEF, WHIRLPOOL, SHARK };
+enum EndingPhase { END_PHASE_APPROACH, END_PHASE_BLOW, END_PHASE_FLY };
+
+// ==================== 动画片段 ====================
+struct AnimClip {
+    vector<IMAGE*> frames;
+    int frameDelay;
+    int currentFrame;
+    int timer;
+
+    AnimClip() : frameDelay(5), currentFrame(0), timer(0) {}
+
+    void addFrame(const wchar_t* path) {
+        IMAGE* img = new IMAGE();
+        loadimage(img, path);
+        frames.push_back(img);
+    }
+
+    IMAGE* update() {
+        if (frames.empty()) return nullptr;
+        timer++;
+        if (timer >= frameDelay) {
+            timer = 0;
+            currentFrame = (currentFrame + 1) % frames.size();
+        }
+        return frames[currentFrame];
+    }
+
+    IMAGE* current() const {
+        if (frames.empty()) return nullptr;
+        return frames[currentFrame];
+    }
+
+    void reset() {
+        currentFrame = 0;
+        timer = 0;
+    }
+
+    void release() {
+        for (auto& p : frames) delete p;
+        frames.clear();
+    }
+
+    bool empty() const { return frames.empty(); }
+};
+
+// ==================== 游戏资源 ====================
+struct GameAssets {
+    // 常规动画
+    AnimClip animRun;
+    AnimClip animJump;
+    AnimClip animDash;
+    AnimClip animSwim;
+    AnimClip animSurf;
+    AnimClip animBoat;
+    // 结局动画
+    AnimClip animBlow;          // 吹气动作（小鸡毛）
+    AnimClip animBalloonForm;   // 小白变成气球的过程
+    AnimClip animFly;           // 拉着气球飞走的循环动画
+
+    // 单张图片
+    IMAGE* imgBone = nullptr;
+    IMAGE* imgRock = nullptr;
+    IMAGE* imgPit = nullptr;
+    IMAGE* imgStump = nullptr;
+    IMAGE* imgReef = nullptr;
+    IMAGE* imgWhirlpool = nullptr;
+    IMAGE* imgShark = nullptr;
+    IMAGE* imgSky = nullptr;
+    IMAGE* imgGround = nullptr;
+    IMAGE* imgWater = nullptr;
+    IMAGE* imgWhite = nullptr;          // 小白常态
+    IMAGE* imgBalloon = nullptr;        // 气球（最终形态）
+    IMAGE* imgVillain = nullptr;
+    IMAGE* imgCliff = nullptr;
+    IMAGE* imgRope = nullptr;           // 绳子素材（可选）
+
+    void loadAnimClip(AnimClip& clip, const string& baseName, int frameCount) {
+        for (int i = 1; i <= frameCount; ++i) {
+            wstring path = L"res/" + wstring(baseName.begin(), baseName.end()) + L"_" + std::to_wstring(i) + L".png";
+            clip.addFrame(path.c_str());
+        }
+        clip.frameDelay = 5;
+    }
+
+    void load() {
+        // 常规动画
+        loadAnimClip(animRun, "run", 4);
+        loadAnimClip(animJump, "jump", 2);
+        loadAnimClip(animDash, "dash", 2);
+        loadAnimClip(animSwim, "swim", 3);
+        loadAnimClip(animSurf, "surf", 3);
+        loadAnimClip(animBoat, "boat", 3);
+        // 结局动画（可自定义帧数）
+        loadAnimClip(animBlow, "blow", 4);  // 小鸡毛吹气4帧
+        loadAnimClip(animBalloonForm, "balloon_form", 4);  // 小白变气球4帧
+        loadAnimClip(animFly, "fly", 3);  // 飞行循环3帧
+
+        auto loadImg = [](IMAGE*& img, const wchar_t* path) {
+            img = new IMAGE();
+            loadimage(img, path);
+            };
+        loadImg(imgBone, L"res/bone.png");
+        loadImg(imgRock, L"res/rock.png");
+        loadImg(imgPit, L"res/pit.png");
+        loadImg(imgStump, L"res/stump.png");
+        loadImg(imgReef, L"res/reef.png");
+        loadImg(imgWhirlpool, L"res/whirlpool.png");
+        loadImg(imgShark, L"res/shark.png");
+        loadImg(imgSky, L"res/sky.png");
+        loadImg(imgGround, L"res/ground.png");
+        loadImg(imgWater, L"res/water.png");
+        loadImg(imgWhite, L"res/white.png");
+        loadImg(imgBalloon, L"res/balloon.png");
+        loadImg(imgVillain, L"res/villain.png");
+        loadImg(imgCliff, L"res/cliff.png");
+        loadImg(imgRope, L"res/rope.png");       // 可选
+    }
+
+    void release() {
+        animRun.release(); animJump.release(); animDash.release();
+        animSwim.release(); animSurf.release(); animBoat.release();
+        animBlow.release(); animBalloonForm.release(); animFly.release();
+
+        delete imgBone; delete imgRock; delete imgPit; delete imgStump;
+        delete imgReef; delete imgWhirlpool; delete imgShark;
+        delete imgSky; delete imgGround; delete imgWater;
+        delete imgWhite; delete imgBalloon; delete imgVillain;
+        delete imgCliff; delete imgRope;
+    }
+};
+
+// ==================== 基础结构体 ====================
+struct GameObject {
+    float x, y, vx, vy;
+    int width, height;
+    bool active;
+};
+
+struct Bone : public GameObject {
+    Bone(float _x, float _y) {
+        x = _x; y = _y; vx = 0; vy = 0;
+        width = 24; height = 24; active = true;
+    }
+};
+
+struct Obstacle : public GameObject {
+    ObstacleType type;
+    Obstacle(float _x, float _y, ObstacleType _type) {
+        x = _x; y = _y; vx = -LAND_SPEED; vy = 0;
+        type = _type; active = true;
+        switch (type) {
+        case ROCK: width = 40; height = 40; break;
+        case PIT:  width = 80; height = 24; break;
+        case STUMP: width = 30; height = 50; break;
+        case REEF: width = 50; height = 40; break;
+        case WHIRLPOOL: width = 40; height = 40; break;
+        case SHARK: width = 70; height = 40; break;
+        }
+    }
+};
+
+// ==================== 玩家角色 ====================
+class Player {
+public:
+    float x, y, vx, vy;
+    int width, height;
+    bool onGround, canDoubleJump, isDashing;
+    int dashCooldown, bonesCollected, jumpCount;
+    VehicleType vehicle;
+    bool inWater;
+
+    Player() {
+        x = 150; y = GROUND_Y - 60;
+        vx = 0; vy = 0;
+        width = 50; height = 60;
+        onGround = false; canDoubleJump = true; isDashing = false;
+        dashCooldown = 0; bonesCollected = 0; vehicle = SWIM;
+        jumpCount = 0; inWater = false;
+    }
+
+    void jump() {
+        if (onGround) {
+            vy = JUMP_SPEED;
+            onGround = false;
+            jumpCount = 1;
+        }
+        else if (canDoubleJump && jumpCount == 1) {
+            vy = DOUBLE_JUMP_SPEED;
+            jumpCount = 2;
+            canDoubleJump = false;
+        }
+    }
+
+    void dash() {
+        if (!isDashing && dashCooldown <= 0) {
+            isDashing = true;
+            vx = DASH_SPEED;
+            dashCooldown = 60;    // 约1秒冷却
+        }
+    }
+
+    void updateLand() {
+        // 重力
+        vy += GRAVITY;
+        y += vy;
+        // 地面碰撞
+        if (y + height >= GROUND_Y) {
+            y = GROUND_Y - height;
+            vy = 0;
+            onGround = true;
+            jumpCount = 0;
+            canDoubleJump = true;
+        }
+        else {
+            onGround = false;
+        }
+        // dash 冷却
+        if (dashCooldown > 0) dashCooldown--;
+        // dash 速度衰减
+        if (isDashing) {
+            vx -= 0.5f;
+            if (vx <= 0) {
+                vx = 0;
+                isDashing = false;
+            }
+        }
+        // 防止跑出屏幕左侧
+        if (x < 0) x = 0;
+        if (x > WIDTH - width) x = WIDTH - width;   // 如需世界移动可去除此行
+    }
+
+    void updateWater() {
+        // 上下移动
+        if (GetAsyncKeyState(VK_UP) & 0x8000)   y -= 4;
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000) y += 4;
+        // 边界
+        if (y < 50) y = 50;
+        if (y + height > HEIGHT - 50) y = HEIGHT - 50 - height;
+        // 冷却
+        if (dashCooldown > 0) dashCooldown--;
+    }
+};
+
+// ==================== 游戏核心类 ====================
+class Game {
+public:
+    GameState state;
+    Player player;
+    vector<Bone> bones;
+    vector<Obstacle> obstacles;
+    int timeLeft, frameCount;
+    float landScrollOffset, waterScrollOffset;
+    bool levelComplete;
+    int landEndX;
+    float waterEndX;
+
+    // 结局专用变量
+    EndingPhase endPhase;
+    float endX, endY;          // 小鸡毛位置
+    float whiteX, whiteY;      // 小白位置
+    float balloonX, balloonY;  // 气球位置（与小白重叠或分离）
+    int endTimer;              // 阶段计时器
+    bool endBlowDone;          // 吹气动画是否播放完一轮
+
+    GameAssets assets;
+
+    Game() : state(MENU), landEndX(6000), waterEndX(8000) {
+        assets.load();
+        initLandLevel();
+    }
+    ~Game() { assets.release(); }
+
+    void initLandLevel() {
+        player = Player();
+        bones.clear(); obstacles.clear();
+        timeLeft = MAX_TIME;
+        landScrollOffset = 0; levelComplete = false;
+        for (int i = 300; i < landEndX - 500; i += 400 + rand() % 300)
+            bones.emplace_back((float)i, GROUND_Y - 60 - rand() % 60);
+        for (int i = 500; i < landEndX - 600; i += 300 + rand() % 400) {
+            ObstacleType t = (ObstacleType)(rand() % 3);
+            obstacles.emplace_back((float)i, t == PIT ? (float)(GROUND_Y - 20) : (float)(GROUND_Y - (t == ROCK ? 40 : 50)), t);
+        }
+    }
+
+    void initWaterLevel() {
+        player.x = 100; player.y = 350; player.vy = 0;
+        bones.clear(); obstacles.clear();
+        timeLeft = MAX_TIME; waterScrollOffset = 0; levelComplete = false;
+        for (int i = 400; i < waterEndX - 600; i += 300 + rand() % 350) {
+            ObstacleType t = (ObstacleType)(REEF + rand() % 3);
+            float yPos = 250.0f + rand() % 200;
+            if (t == SHARK) yPos = 380 + rand() % 40;
+            obstacles.emplace_back((float)i, yPos, t);
+        }
+    }
+
+    void update() {
+        frameCount++;
+        switch (state) {
+        case MENU: updateMenu(); break;
+        case LAND_LEVEL: updateLand(); break;
+        case VEHICLE_SELECT: updateVehicleSelect(); break;
+        case WATER_LEVEL: updateWater(); break;
+        case ENDING: updateEnding(); break;
+        }
+    }
+
+    void updateMenu() {
+        if (GetAsyncKeyState(VK_SPACE) & 0x8001) { state = LAND_LEVEL; initLandLevel(); }
+    }
+
+    void updateLand() {
+        if (levelComplete) return;
+        if (frameCount % 60 == 0 && timeLeft > 0) timeLeft--;
+        if (timeLeft <= 0) { initLandLevel(); return; }
+        if (GetAsyncKeyState(VK_SPACE) & 0x8001) player.jump();
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8001) player.dash();
+        
+        player.updateLand();
+        landScrollOffset += LAND_SPEED;
+        for (auto& b : bones) { b.x -= LAND_SPEED; if (b.x < -50) b.active = false; }
+        for (auto& ob : obstacles) { ob.x -= LAND_SPEED; if (ob.x < -100) ob.active = false; }
+        detectLandCollisions();
+        if (landScrollOffset + player.x >= landEndX) { levelComplete = true; state = VEHICLE_SELECT; }
+        auto act = [](auto& obj) { return !obj.active; };
+        bones.erase(std::remove_if(bones.begin(), bones.end(), act), bones.end());
+        obstacles.erase(std::remove_if(obstacles.begin(), obstacles.end(), act), obstacles.end());
+    }
+
+    void detectLandCollisions() {
+        for (auto& b : bones) {
+            if (!b.active) continue;
+            if (player.x + player.width > b.x && player.x < b.x + b.width &&
+                player.y + player.height > b.y && player.y < b.y + b.height) {
+                b.active = false; player.bonesCollected++;
+            }
+        }
+        for (auto& ob : obstacles) {
+            if (!ob.active) continue;
+            if (ob.type == PIT) {
+                if (player.onGround && player.x + player.width > ob.x && player.x < ob.x + ob.width) { initLandLevel(); return; }
+            }
+            else {
+                if (player.x + player.width - 10 > ob.x && player.x + 10 < ob.x + ob.width &&
+                    player.y + player.height - 10 > ob.y && player.y + 10 < ob.y + ob.height) {
+                    initLandLevel(); return;
+                }
+            }
+        }
+    }
+
+    void updateVehicleSelect() {
+        static bool sel = false;
+        if (!sel) {
+            if (GetAsyncKeyState('1') & 0x8001) { player.vehicle = SWIM; sel = true; }
+            else if ((GetAsyncKeyState('2') & 0x8001) && player.bonesCollected >= BONE_TARGET) { player.vehicle = SURFBOARD; sel = true; }
+            else if ((GetAsyncKeyState('3') & 0x8001) && player.bonesCollected >= BONE_TARGET + 3) { player.vehicle = BOAT; sel = true; }
+            if (sel) { state = WATER_LEVEL; initWaterLevel(); sel = false; }
+        }
+    }
+
+    void updateWater() {
+        if (levelComplete) return;
+        if (frameCount % 60 == 0 && timeLeft > 0) timeLeft--;
+        if (timeLeft <= 0) { initWaterLevel(); return; }
+        player.updateWater();
+        float speed = 0;
+        switch (player.vehicle) { case SWIM: speed = 4; break; case SURFBOARD: speed = 7; break; case BOAT: speed = 10; break; }
+                                           waterScrollOffset += speed;
+                                           for (auto& ob : obstacles) { ob.x -= speed; if (ob.x < -100) ob.active = false; }
+                                           detectWaterCollisions();
+                                           obstacles.erase(std::remove_if(obstacles.begin(), obstacles.end(), [](const Obstacle& o) { return !o.active; }), obstacles.end());
+                                           if (waterScrollOffset + player.x >= waterEndX) {
+                                               levelComplete = true; state = ENDING;
+                                               initEnding();
+                                           }
+    }
+
+    void detectWaterCollisions() {
+        for (auto& ob : obstacles) {
+            if (!ob.active) continue;
+            if (player.x + player.width > ob.x && player.x < ob.x + ob.width &&
+                player.y + player.height > ob.y && player.y < ob.y + ob.height) {
+                initWaterLevel(); return;
+            }
+        }
+    }
+
+    // =============== 结局初始化与更新 ===============
+    void initEnding() {
+        endPhase = END_PHASE_APPROACH;
+        endX = 150; endY = GROUND_Y - 60;
+        whiteX = 600; whiteY = GROUND_Y - 60;   // 小白初始在山崖附近
+        balloonX = whiteX; balloonY = whiteY;   // 先与小白重合
+        endTimer = 0;
+        endBlowDone = false;
+        assets.animBlow.reset();
+        assets.animBalloonForm.reset();
+        assets.animFly.reset();
+    }
+
+    void updateEnding() {
+        endTimer++;
+
+        switch (endPhase) {
+        case END_PHASE_APPROACH:
+            // 小鸡毛向小白移动
+            if (endX < whiteX - 60) endX += 3.0f;
+            else {
+                // 到达小白身边，进入吹气阶段
+                endPhase = END_PHASE_BLOW;
+                endTimer = 0;
+            }
+            break;
+
+        case END_PHASE_BLOW:
+            // 播放吹气动画 loop（可设定播放一定时间后进入飞行）
+            // 这里设定播放 120 帧（约2秒）后进入飞行
+            if (endTimer > 120) {
+                endPhase = END_PHASE_FLY;
+                endTimer = 0;
+                endBlowDone = true;
+            }
+            break;
+
+        case END_PHASE_FLY:
+            // 气球带着小鸡毛向上向右飘走
+            endX += 1.5f;
+            endY -= 2.0f;
+            balloonX = endX + 30;   // 气球位置相对于小鸡毛
+            balloonY = endY - 60;
+            whiteX = balloonX;      // 小白已变成气球，跟随移动
+            whiteY = balloonY;
+            if (endY < -150) {
+                // 离开屏幕，回到主菜单
+                state = MENU;
+                player = Player();
+                initLandLevel();
+            }
+            break;
+        }
+    }
+
+    // ==================== 绘制函数 ====================
+    void draw() {
+        cleardevice();
+        switch (state) {
+        case MENU: drawMenu(); break;
+        case LAND_LEVEL: drawLand(); break;
+        case VEHICLE_SELECT: drawVehicleSelect(); break;
+        case WATER_LEVEL: drawWater(); break;
+        case ENDING: drawEnding(); break;
+        }
+    }
+
+    // 辅助：安全绘制图片，若图片为空则无操作
+    void safePutImage(int x, int y, IMAGE* img) {
+        if (img) putimage(x, y, img);
+    }
+
+    void drawMenu() {
+        setfillcolor(0x87CEEB); solidrectangle(0, 0, WIDTH, HEIGHT);
+        settextstyle(40, 0, _T("楷体"));
+        outtextxy(250, 150, _T("线条小狗跑酷"));
+        settextstyle(22, 0, _T("楷体"));
+        outtextxy(300, 280, _T("空格键开始"));
+        outtextxy(200, 350, _T("陆地：空格跳跃/二段跳，Shift冲刺"));
+        outtextxy(200, 400, _T("水上：↑↓移动，不同载具速度不同"));
+    }
+
+    void drawLand() {
+        if (assets.imgSky) putimage(0, 0, assets.imgSky);
+        else { setfillcolor(0x87CEEB); solidrectangle(0, 0, WIDTH, HEIGHT); }
+
+        if (assets.imgGround) {
+            for (int i = -(int)((int)landScrollOffset % 200); i < WIDTH; i += 200)
+                putimage(i, GROUND_Y, assets.imgGround);
+        }
+        else { setfillcolor(0x8B4513); solidrectangle(0, GROUND_Y, WIDTH, HEIGHT); }
+
+        for (auto& b : bones) {
+            int dx = (int)(b.x - landScrollOffset);
+            if (assets.imgBone) putimage(dx, (int)b.y, assets.imgBone);
+            else { setfillcolor(0xFFFFE0); solidellipse(dx, (int)b.y, dx + b.width, (int)b.y + b.height); }
+        }
+
+        for (auto& ob : obstacles) {
+            int dx = (int)(ob.x - landScrollOffset);
+            IMAGE* img = nullptr;
+            switch (ob.type) {
+            case ROCK: img = assets.imgRock; break;
+            case PIT:  img = assets.imgPit; break;
+            case STUMP:img = assets.imgStump; break;
+            }
+            if (img) putimage(dx, (int)ob.y, img);
+            else {
+                setfillcolor(ob.type == ROCK ? 0x808080 : (ob.type == PIT ? 0x000000 : 0x8B4513));
+                solidrectangle(dx, (int)ob.y, dx + ob.width, (int)ob.y + ob.height);
+            }
+        }
+
+        drawPlayerLandAnimation();
+        TCHAR buf[256];
+        swprintf_s(buf, _T("时间: %d  骨头: %d"), timeLeft, player.bonesCollected);
+        outtextxy(20, 20, buf);
+    }
+
+    void drawPlayerLandAnimation() {
+        AnimClip* curClip = nullptr;
+        if (player.isDashing) curClip = &assets.animDash;
+        else if (!player.onGround) curClip = &assets.animJump;
+        else curClip = &assets.animRun;
+
+        IMAGE* frame = curClip ? curClip->update() : nullptr;
+        if (frame) putimage((int)player.x, (int)player.y, frame);
+        else {
+            setfillcolor(0xFFD700);
+            solidellipse((int)player.x, (int)player.y, (int)player.x + player.width, (int)player.y + player.height);
+            setfillcolor(0xDAA520);
+            solidellipse((int)player.x + 5, (int)player.y - 10, (int)player.x + 15, (int)player.y);
+            solidellipse((int)player.x + 35, (int)player.y - 10, (int)player.x + 48, (int)player.y);
+        }
+    }
+
+    void drawVehicleSelect() {
+        setfillcolor(0x87CEEB); solidrectangle(0, 0, WIDTH, HEIGHT);
+        settextstyle(28, 0, _T("楷体")); outtextxy(200, 80, _T("选择水上载具 (按数字键)"));
+        settextstyle(22, 0, _T("楷体"));
+        TCHAR buf[256];
+        swprintf_s(buf, _T("当前骨头：%d"), player.bonesCollected);
+        outtextxy(300, 130, buf);
+        outtextxy(150, 200, _T("1. 游泳"));
+        if (player.bonesCollected >= BONE_TARGET) outtextxy(150, 250, _T("2. 冲浪板"));
+        else { settextcolor(0x808080); outtextxy(150, 250, _T("2. 冲浪板 (需5骨头)")); settextcolor(0x000000); }
+        if (player.bonesCollected >= BONE_TARGET + 3) outtextxy(150, 300, _T("3. 小船"));
+        else { settextcolor(0x808080); outtextxy(150, 300, _T("3. 小船 (需8骨头)")); settextcolor(0x000000); }
+    }
+
+    void drawWater() {
+        if (assets.imgWater) putimage(0, 0, assets.imgWater);
+        else {
+            setfillcolor(0x4682B4); solidrectangle(0, 0, WIDTH, HEIGHT);
+        }
+        for (auto& ob : obstacles) {
+            int dx = (int)(ob.x - waterScrollOffset);
+            IMAGE* img = nullptr;
+            switch (ob.type) {
+            case REEF: img = assets.imgReef; break;
+            case WHIRLPOOL: img = assets.imgWhirlpool; break;
+            case SHARK: img = assets.imgShark; break;
+            }
+            if (img) putimage(dx, (int)ob.y, img);
+            else {
+                setfillcolor(ob.type == REEF ? 0x808080 : (ob.type == WHIRLPOOL ? 0x0000CD : 0x2F4F4F));
+                if (ob.type == WHIRLPOOL) solidellipse(dx, (int)ob.y, dx + ob.width, (int)ob.y + ob.height);
+                else solidrectangle(dx, (int)ob.y, dx + ob.width, (int)ob.y + ob.height);
+            }
+        }
+        drawPlayerWaterAnimation();
+        TCHAR buf[256]; swprintf_s(buf, _T("时间: %d"), timeLeft); outtextxy(20, 20, buf);
+    }
+
+    void drawPlayerWaterAnimation() {
+        AnimClip* curClip = nullptr;
+        switch (player.vehicle) {
+        case SWIM: curClip = &assets.animSwim; break;
+        case SURFBOARD: curClip = &assets.animSurf; break;
+        case BOAT: curClip = &assets.animBoat; break;
+        }
+        IMAGE* frame = curClip ? curClip->update() : nullptr;
+        if (frame) putimage((int)player.x, (int)player.y, frame);
+        else {
+            setfillcolor(0xFFD700);
+            if (player.vehicle == SWIM) {
+                solidellipse((int)player.x, (int)player.y, (int)player.x + player.width, (int)player.y + player.height);
+            }
+            else if (player.vehicle == SURFBOARD) {
+                solidellipse((int)player.x, (int)player.y - 10, (int)player.x + player.width, (int)player.y + 20);
+                setfillcolor(0x8B4513);
+                solidrectangle((int)player.x - 5, (int)player.y + 20, (int)player.x + player.width + 5, (int)player.y + 25);
+            }
+            else {
+                setfillcolor(0x8B4513);
+                solidrectangle((int)player.x, (int)player.y + 10, (int)player.x + player.width, (int)player.y + 40);
+                setfillcolor(0xFFD700);
+                solidellipse((int)player.x + 10, (int)player.y - 5, (int)player.x + player.width - 10, (int)player.y + 15);
+            }
+        }
+    }
+
+    // =============== 结局绘制 ===============
+    void drawEnding() {
+        // 背景天空
+        if (assets.imgSky) putimage(0, 0, assets.imgSky);
+        else { setfillcolor(0x87CEEB); solidrectangle(0, 0, WIDTH, HEIGHT); }
+
+        // 地面/山崖（固定）
+        if (assets.imgCliff) putimage(200, 350, assets.imgCliff);
+        else {
+            setfillcolor(0x8B4513); solidrectangle(0, 400, WIDTH, HEIGHT);
+            setfillcolor(0x654321); solidrectangle(300, 380, WIDTH, 400);
+        }
+
+        // 反派（静止）
+        if (assets.imgVillain) putimage(500, 280, assets.imgVillain);
+        else {
+            setfillcolor(0x000000);
+            solidellipse(550, 300, 600, 360);
+            solidrectangle(560, 360, 590, 400);
+        }
+
+        // ===== 根据结局阶段绘制角色 =====
+        switch (endPhase) {
+        case END_PHASE_APPROACH:
+            // 小鸡毛跑步向小白
+            drawDogRun((int)endX, (int)endY);
+            // 小白在原地等着
+            drawWhite((int)whiteX, (int)whiteY);
+            break;
+
+        case END_PHASE_BLOW:
+            // 小鸡毛播放吹气动画
+            drawBlowAnimation((int)endX, (int)endY);
+            // 小白变成气球的过程（播放变形动画或显示气球）
+            if (!assets.animBalloonForm.empty()) {
+                IMAGE* formFrame = assets.animBalloonForm.update();
+                if (formFrame) putimage((int)whiteX, (int)whiteY, formFrame);
+            }
+            else {
+                // 简单过渡：逐渐变大变圆
+                float progress = min(1.0f, endTimer / 60.0f); // 0~1
+                int r = (int)(15 + progress * 20); // 小白从15半径变到35半径
+                setfillcolor(0xFFFFFF);
+                solidellipse((int)whiteX + 25 - r, (int)whiteY + 25 - r,
+                    (int)whiteX + 25 + r, (int)whiteY + 25 + r);
+            }
+            break;
+
+        case END_PHASE_FLY:
+            // 小鸡毛拉着气球飞走
+            drawFlyAnimation((int)endX, (int)endY, (int)balloonX, (int)balloonY);
+            break;
+        }
+    }
+
+    // --- 结局辅助绘制函数 ---
+    void drawDogRun(int px, int py) {
+        IMAGE* frame = assets.animRun.update();
+        if (frame) putimage(px, py, frame);
+        else {
+            setfillcolor(0xFFD700);
+            solidellipse(px, py, px + 50, py + 60);
+        }
+    }
+
+    void drawWhite(int px, int py) {
+        if (assets.imgWhite) putimage(px, py, assets.imgWhite);
+        else {
+            setfillcolor(0xFFFFFF);
+            solidellipse(px + 10, py + 10, px + 40, py + 50); // 简单的白色椭圆代表小白
+        }
+    }
+
+    void drawBlowAnimation(int px, int py) {
+        IMAGE* frame = assets.animBlow.update();
+        if (frame) putimage(px, py, frame);
+        else {
+            // 如果没有吹气动画，画小鸡毛 + 几张简单的线条表示吹气
+            setfillcolor(0xFFD700);
+            solidellipse(px, py, px + 50, py + 60);
+            // 画几条弧线表示气流
+            setlinecolor(0x000000);
+            arc(px + 60, py + 10, px + 80, py + 30, 0.0, 3.14 / 2); // 示意
+            setlinecolor(0xFFFFFF); // 恢复
+        }
+    }
+
+    void drawFlyAnimation(int px, int py, int bx, int by) {
+        // 气球
+        if (assets.imgBalloon) putimage(bx, by, assets.imgBalloon);
+        else {
+            setfillcolor(0xFF6666);
+            solidellipse(bx, by, bx + 40, by + 50);
+            // 画个绳结
+            setfillcolor(0x8B4513);
+            solidrectangle(bx + 18, by + 50, bx + 22, by + 55);
+        }
+
+        // 绳子
+        if (assets.imgRope) {
+            // 简单拉伸？为避免复杂，直接绘制在中间
+            putimage(px + 40, py, assets.imgRope);
+        }
+        else {
+            setlinecolor(0x000000);
+            line(px + 40, py + 10, bx + 20, by + 50);
+        }
+
+        // 小鸡毛飞行动画
+        IMAGE* frame = assets.animFly.update();
+        if (frame) putimage(px, py, frame);
+        else {
+            setfillcolor(0xFFD700);
+            solidellipse(px, py, px + 50, py + 60);
+        }
+    }
+};
+
+// ==================== 主函数 ====================
+int main() {
+    initgraph(WIDTH, HEIGHT);
+    setbkcolor(0xFFFFFF);
+    setbkmode(TRANSPARENT);
+    BeginBatchDraw();
+    Game game;
+    while (!_kbhit() || _getch() != 27) {
+        game.update();
+        game.draw();
+        FlushBatchDraw();
+        Sleep(16);
+    }
+    EndBatchDraw();
+    closegraph();
+    return 0;
+}
