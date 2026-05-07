@@ -1,0 +1,743 @@
+#include <graphics.h>
+#include <conio.h>
+#include <time.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+
+#pragma comment(lib, "Winmm.lib")
+
+using std::vector;
+using std::string;
+using std::wstring;
+
+// ==========================================
+// 1. 游戏全局配置与核心参数 (数值策划区)
+// ==========================================
+const int WIDTH = 1200;                  // 窗口宽度
+const int HEIGHT = 800;                  // 窗口高度
+const int GROUND_Y = 650;                // 陆地地平线的 Y 坐标（决定角色站在哪）
+
+const int MAX_TIME = 55;                 // 关卡时间限制（秒）
+const int BONE_TARGET = 10;              // 陆地通关最低所需骨头数
+const int BONE_TARGET_BOAT = 25;         // 解锁终极载具（小船）所需骨头数
+
+// 物理引擎参数：决定了角色的跳跃手感
+const float GRAVITY = 0.8f;              // 重力加速度（越小滞空越长）
+const float JUMP_SPEED = -16.0f;         // 一段跳起跳初速度（负数表示向上）
+const float DOUBLE_JUMP_SPEED = -13.0f;  // 二段跳接力初速度
+const float LAND_SPEED = 8.0f;           // 陆地关卡基础卷轴滚动速度
+
+// 游戏状态机与类型枚举
+enum GameState { MENU, LAND_LEVEL, VEHICLE_SELECT, WATER_LEVEL, FINAL_LAND, VICTORY, GAME_OVER };
+enum VehicleType { SURFBOARD, BOAT };
+enum ObstacleType { ROCK, PIT, STUMP, REEF, WHIRLPOOL, SHARK };
+
+// ==========================================
+// 2. 动画与资源管理引擎
+// ==========================================
+
+// 序列帧动画播放器：负责处理角色的跑动、跳跃等多张图片的循环播放
+struct AnimClip {
+    vector<IMAGE*> frames;
+    int frameDelay, currentFrame, timer;
+    int frameWidth = 0, frameHeight = 0;
+
+    AnimClip() : frameDelay(5), currentFrame(0), timer(0) {}
+
+    void addFrame(const wchar_t* path) {
+        IMAGE* img = new IMAGE();
+        loadimage(img, path);
+        if (img->getwidth() == 0) { delete img; return; } // 防止加载空图片
+        frames.push_back(img);
+        if (frameWidth == 0) {
+            frameWidth = img->getwidth();
+            frameHeight = img->getheight();
+        }
+    }
+
+    // 核心推进函数：每次调用都会计时，达到 frameDelay 后切换到下一帧
+    IMAGE* update() {
+        if (frames.empty()) return nullptr;
+        timer++;
+        if (timer >= frameDelay) {
+            timer = 0;
+            currentFrame = (currentFrame + 1) % frames.size();
+        }
+        return frames[currentFrame];
+    }
+
+    void reset() { currentFrame = 0; timer = 0; }
+    void release() { for (auto& p : frames) delete p; frames.clear(); }
+    bool empty() const { return frames.empty(); }
+};
+
+// 游戏全局资源库：集中管理所有图片和动画，防止内存泄漏
+struct GameAssets {
+    AnimClip animRun, animJump, animSurf, animBoat;
+
+    struct ImageInfo {
+        IMAGE* img = nullptr;
+        int w = 0, h = 0;
+    };
+
+    ImageInfo imgBone, imgRock, imgPit, imgStump;
+    ImageInfo imgReef, imgWhirlpool, imgShark;
+    ImageInfo imgSky, imgGround, imgWater, imgMenuBg, imgEndBg, imgXiaobai;
+
+    void loadAnimClip(AnimClip& clip, const string& baseName, int frameCount) {
+        for (int i = 1; i <= frameCount; ++i) {
+            wstring path = L"res/" + wstring(baseName.begin(), baseName.end()) + L"_" + std::to_wstring(i) + L".png";
+            clip.addFrame(path.c_str());
+        }
+    }
+
+    // 带缩放功能的图片加载器，防止因原图尺寸不对导致 7参数 putimage 失败
+    void loadImage(ImageInfo& info, const wchar_t* path, int resizeW = 0, int resizeH = 0) {
+        IMAGE* temp = new IMAGE();
+        if (resizeW > 0 && resizeH > 0) loadimage(temp, path, resizeW, resizeH, true);
+        else loadimage(temp, path);
+        
+        if (temp->getwidth() == 0) { delete temp; info.img = nullptr; } 
+        else { info.img = temp; info.w = temp->getwidth(); info.h = temp->getheight(); }
+    }
+
+    void load() {
+        loadAnimClip(animRun,  "run", 4);
+        loadAnimClip(animJump, "jump", 2);
+        loadAnimClip(animSurf, "surf", 3);
+        loadAnimClip(animBoat, "boat", 3);
+
+        loadImage(imgBone, L"res/bone.png");
+        loadImage(imgRock, L"res/rock.png");
+        loadImage(imgPit, L"res/pit.png");
+        loadImage(imgStump, L"res/stump.png");
+        loadImage(imgReef, L"res/reef.png");
+        loadImage(imgWhirlpool, L"res/whirlpool.png");
+        loadImage(imgShark, L"res/shark.png");
+
+        // 全屏背景强制拉伸到屏幕尺寸
+        loadImage(imgSky, L"res/sky.png", WIDTH, HEIGHT);
+        loadImage(imgWater, L"res/water.png", WIDTH, HEIGHT);
+        loadImage(imgMenuBg, L"res/menu_bg.png", WIDTH, HEIGHT);
+        loadImage(imgEndBg, L"res/end_bg.png", WIDTH, HEIGHT);
+        
+        loadImage(imgGround, L"res/ground.png");
+        loadImage(imgXiaobai, L"res/xiaobai.png");
+    }
+
+    void release() {
+        animRun.release(); animJump.release(); animSurf.release(); animBoat.release();
+        auto del = [](ImageInfo& info) { if (info.img) delete info.img; };
+        del(imgBone); del(imgRock); del(imgPit); del(imgStump);
+        del(imgReef); del(imgWhirlpool); del(imgShark);
+        del(imgSky); del(imgGround); del(imgWater);
+        del(imgMenuBg); del(imgEndBg); del(imgXiaobai);
+    }
+};
+
+// ==========================================
+// 3. 游戏实体定义
+// ==========================================
+struct Bone { float x, y; int w, h; bool active = true; Bone(float _x, float _y, int _w, int _h) : x(_x), y(_y), w(_w), h(_h) {} };
+struct Obstacle { float x, y; ObstacleType type; int w, h; bool active = true; Obstacle(float _x, float _y, ObstacleType _type, int _w, int _h) : x(_x), y(_y), type(_type), w(_w), h(_h) {} };
+
+class Player {
+public:
+    float x, y, vx, vy;
+    int w = 50, h = 60;
+    
+    // 动作与控制状态
+    bool onGround = false, canDoubleJump = true;
+    int bonesCollected = 0, jumpCount = 0;
+    VehicleType vehicle = SURFBOARD;
+
+    // 血量与惩罚状态
+    int maxHp = 5;
+    int hp = 5; 
+    int invulnerableTimer = 0; // 受伤后的无敌闪烁时间
+    int slowdownTimer = 0;     // 撞击障碍物后的僵直减速时间
+
+    Player() { x = 150; y = GROUND_Y - 60; vx = vy = 0; maxHp = 5; hp = 5; invulnerableTimer = 0; slowdownTimer = 0;}
+
+    void updateTimers() {
+        if (invulnerableTimer > 0) invulnerableTimer--;
+        if (slowdownTimer > 0) slowdownTimer--; 
+    }
+
+    void jump() {
+        if (onGround) { vy = JUMP_SPEED; onGround = false; jumpCount = 1; }
+        else if (canDoubleJump && jumpCount == 1) { vy = DOUBLE_JUMP_SPEED; jumpCount = 2; canDoubleJump = false; }
+    }
+
+    void updateLand() {
+        vy += GRAVITY; y += vy; // 施加重力
+        if (y + h >= GROUND_Y) { 
+            y = GROUND_Y - h; vy = 0; 
+            onGround = true; jumpCount = 0; canDoubleJump = true; // 落地重置二段跳
+        }
+        else onGround = false;
+        
+        // 限制玩家不出屏幕左边缘
+        if (x < 0) x = 0;
+        if (x > WIDTH - w) x = WIDTH - w;
+    }
+
+    void updateWater() {
+        // 水面由上下键控制，无重力
+        if (GetAsyncKeyState(VK_UP) & 0x8000)   y -= 6; 
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000) y += 6;
+        if (y < 50) y = 50;
+        if (y + h > HEIGHT - 50) y = HEIGHT - 50 - h;
+    }
+};
+
+// ==========================================
+// 4. 游戏主逻辑与生命周期控制
+// ==========================================
+class Game {
+public:
+    GameState state = MENU;
+    Player player;
+    vector<Bone> bones;
+    vector<Obstacle> obstacles;
+    
+    int timeLeft = MAX_TIME, frameCount = 0;
+    float landScrollOffset = 0, waterScrollOffset = 0;
+    bool levelComplete = false;
+    
+    // 关卡长度设置
+    int landEndX = 10000; 
+    float waterEndX = 12000; 
+    int finalLandEndX = 3000; 
+    
+    GameAssets assets;
+
+    // ------------------------------------------
+    // 电影级平滑转场系统
+    // ------------------------------------------
+    bool isTransitioning = false;
+    GameState nextState = MENU;
+    int transitionTimer = 0;
+    const int transitionMax = 40; // 幕布动画总耗时（帧）
+
+    // 状态切换入口：useTransition 为 true 时，会触发幕布黑屏加载动画
+    void changeState(GameState newState, bool useTransition = false) {
+        if (isTransitioning || state == newState) return; 
+        if (useTransition) {
+            isTransitioning = true;
+            nextState = newState;
+            transitionTimer = 0;
+        } else {
+            state = newState;
+            if (state == LAND_LEVEL) initLandLevel();
+            else if (state == WATER_LEVEL) initWaterLevel();
+            else if (state == FINAL_LAND) initFinalLand();
+        }
+    }
+
+    Game() { srand((unsigned)time(NULL)); assets.load(); initLandLevel(); }
+    ~Game() { assets.release(); }
+
+    // ------------------------------------------
+    // 关卡生成器
+    // ------------------------------------------
+    void initLandLevel() {
+        player = Player(); 
+        if (!assets.animRun.empty()) { player.w = assets.animRun.frameWidth; player.h = assets.animRun.frameHeight; }
+        bones.clear(); obstacles.clear();
+        timeLeft = MAX_TIME; landScrollOffset = 0; levelComplete = false;
+
+        int bw = assets.imgBone.img ? assets.imgBone.w : 24;
+        int bh = assets.imgBone.img ? assets.imgBone.h : 24;
+        
+        auto mkOb = [&](ObstacleType t) {
+            switch(t) {
+                case ROCK:  return Obstacle(0,0,ROCK,  assets.imgRock.img?assets.imgRock.w:40,   assets.imgRock.img?assets.imgRock.h:40);
+                case PIT:   return Obstacle(0,0,PIT,   assets.imgPit.img?assets.imgPit.w:80,     assets.imgPit.img?assets.imgPit.h:24);
+                case STUMP: return Obstacle(0,0,STUMP, assets.imgStump.img?assets.imgStump.w:30, assets.imgStump.img?assets.imgStump.h:50);
+                default:    return Obstacle(0,0,ROCK,40,40);
+            }
+        };
+        
+        // 陆地地形模式化生成：增加地图的节奏感和设计感
+        for (int i = 800; i < landEndX - 800; ) {
+            int pattern = rand() % 4; 
+            if (pattern == 0) { // 【模式0：普通障碍】
+                ObstacleType t = (ObstacleType)(rand() % 3);
+                Obstacle ob = mkOb(t); ob.x = (float)i; ob.y = (float)(GROUND_Y - ob.h);
+                obstacles.push_back(ob);
+                i += 350 + rand() % 150; 
+            } 
+            else if (pattern == 1) { // 【模式1：连续障碍】
+                ObstacleType t = (ObstacleType)(rand() % 3);
+                Obstacle ob = mkOb(t); ob.x = (float)i; ob.y = (float)(GROUND_Y - ob.h);
+                obstacles.push_back(ob);
+                i += 400 + rand() % 150;
+            } 
+            else if (pattern == 2) { // 【模式2：安全空地】
+                i += 350 + rand() % 150;
+            } 
+            else if (pattern == 3) { // 【模式3：坑+石头 强制二段跳地狱】
+                Obstacle ob1 = mkOb(PIT); ob1.x = (float)i; ob1.y = (float)(GROUND_Y - ob1.h);
+                obstacles.push_back(ob1);
+                Obstacle ob2 = mkOb(ROCK); ob2.x = (float)i + ob1.w + 100; ob2.y = (float)(GROUND_Y - ob2.h);
+                obstacles.push_back(ob2);
+                i += 600 + rand() % 100;
+            }
+        }
+        
+        // 独立生成的智能骨头系统（自动避让障碍物）
+        for (int i = 500; i < landEndX - 500; i += 180 + rand() % 100) {
+            bool overlap = false;
+            for (auto& ob : obstacles) {
+                if (abs(i - ob.x) < 120) { overlap = true; break; } 
+            }
+            if (overlap) bones.emplace_back((float)i, GROUND_Y - 240 - rand() % 40, bw, bh); // 障碍上方高空骨头
+            else bones.emplace_back((float)i, GROUND_Y - 60 - rand() % 40, bw, bh);          // 普通地面骨头
+        }
+    }
+
+    void initWaterLevel() {
+        player.x = 100; player.y = 350; player.vy = 0;
+        AnimClip& clip = (player.vehicle == SURFBOARD) ? assets.animSurf : assets.animBoat;
+        if (!clip.empty()) { player.w = clip.frameWidth; player.h = clip.frameHeight; }
+        bones.clear(); obstacles.clear();
+        timeLeft = MAX_TIME; waterScrollOffset = 0; levelComplete = false;
+
+        auto mkOb = [&](ObstacleType t) {
+            switch(t) {
+                case REEF:      return Obstacle(0,0,REEF, assets.imgReef.img?assets.imgReef.w:50, assets.imgReef.img?assets.imgReef.h:40);
+                case WHIRLPOOL: return Obstacle(0,0,WHIRLPOOL, assets.imgWhirlpool.img?assets.imgWhirlpool.w:40, assets.imgWhirlpool.img?assets.imgWhirlpool.h:40);
+                case SHARK:     return Obstacle(0,0,SHARK, assets.imgShark.img?assets.imgShark.w:70, assets.imgShark.img?assets.imgShark.h:40);
+                default:        return Obstacle(0,0,REEF,50,40);
+            }
+        };
+        
+        // 水面地形生成
+        for (int i = 400; i < waterEndX - 600; ) {
+            int pattern = rand() % 3;
+            if (pattern == 0) { // 普通单个水面障碍
+                ObstacleType t = (ObstacleType)(REEF + rand() % 3);
+                Obstacle ob = mkOb(t); ob.x = (float)i; ob.y = 250.0f + rand() % 300;
+                if (t == SHARK) ob.y = 450 + rand() % 100;
+                obstacles.push_back(ob);
+                i += 350 + rand() % 200;
+            } 
+            else if (pattern == 1) { // 【绝命双鲨】上下夹击
+                Obstacle ob1 = mkOb(SHARK); ob1.x = (float)i; ob1.y = 200 + rand() % 50; obstacles.push_back(ob1);
+                Obstacle ob2 = mkOb(SHARK); ob2.x = (float)i; ob2.y = 550 + rand() % 50; obstacles.push_back(ob2);
+                i += 500 + rand() % 200;
+            }
+            else { // 【连续漩涡】
+                Obstacle ob = mkOb(WHIRLPOOL); ob.x = (float)i; ob.y = 300.0f + rand() % 150;
+                obstacles.push_back(ob);
+                i += 300 + rand() % 150;
+            }
+        }
+    }
+
+    void initFinalLand() {
+        player.x = 100; 
+        player.y = GROUND_Y - 60;
+        player.vy = 0;
+        player.onGround = true;
+        if (!assets.animRun.empty()) { player.w = assets.animRun.frameWidth; player.h = assets.animRun.frameHeight; }
+        bones.clear(); obstacles.clear();
+        landScrollOffset = 0; 
+    }
+
+    // ------------------------------------------
+    // 逻辑更新帧
+    // ------------------------------------------
+    void update() {
+        // 如果处于转场动画中，冻结游戏物理逻辑
+        if (isTransitioning) {
+            transitionTimer++;
+            if (transitionTimer == transitionMax / 2) {
+                // 黑屏瞬间切换内部数据状态
+                state = nextState;
+                if (state == LAND_LEVEL) initLandLevel();
+                else if (state == WATER_LEVEL) initWaterLevel();
+                else if (state == FINAL_LAND) initFinalLand();
+            }
+            if (transitionTimer >= transitionMax) isTransitioning = false; // 幕布拉开完毕
+            return; 
+        }
+
+        frameCount++;
+        switch (state) {
+            case MENU:          if (GetAsyncKeyState(VK_SPACE) & 0x8001) { changeState(LAND_LEVEL, false); } break;
+            case LAND_LEVEL:    updateLand(); break;
+            case VEHICLE_SELECT:updateVehicleSelect(); break;
+            case WATER_LEVEL:   updateWater(); break;
+            case FINAL_LAND:    updateFinalLand(); break; 
+            case VICTORY:       updateVictory(); break;
+            case GAME_OVER:     updateGameOver(); break;
+        }
+    }
+
+    void updateLand() {
+        if (levelComplete) return;
+        
+        // 倒计时系统
+        if (frameCount % 60 == 0 && timeLeft > 0) timeLeft--;
+        if (timeLeft <= 0) { changeState(GAME_OVER, false); return; }
+        
+        player.updateTimers(); 
+        
+        // 按键边缘检测：防止长按空格导致瞬间双连跳
+        static bool lastSpaceState = false; 
+        bool currentSpaceState = GetAsyncKeyState(VK_SPACE) & 0x8000; 
+        if (currentSpaceState && !lastSpaceState) { player.jump(); }
+        lastSpaceState = currentSpaceState; 
+
+        player.updateLand();
+        
+        // 减速惩罚机制计算
+        float currentSpeed = LAND_SPEED * (player.slowdownTimer > 0 ? 0.3f : 1.0f);
+        landScrollOffset += currentSpeed;
+        
+        // 更新场景元素坐标（产生镜头向右平移的错觉）
+        for (auto& b : bones) { b.x -= currentSpeed; if (b.x < -b.w) b.active = false; }
+        for (auto& ob : obstacles) { ob.x -= currentSpeed; if (ob.x < -ob.w) ob.active = false; }
+        
+        detectLandCollisions();
+        
+        // 到达陆地终点判定
+        if (landScrollOffset + player.x >= landEndX) {
+            if (player.bonesCollected >= BONE_TARGET) changeState(VEHICLE_SELECT, false); 
+            else changeState(GAME_OVER, false);
+            return;
+        }
+        
+        // 移除已经移出屏幕左侧或被吃掉的元素
+        auto pred = [](auto& o) { return !o.active; };
+        bones.erase(std::remove_if(bones.begin(), bones.end(), pred), bones.end());
+        obstacles.erase(std::remove_if(obstacles.begin(), obstacles.end(), pred), obstacles.end());
+    }
+
+    void detectLandCollisions() {
+        for (auto& b : bones) {
+            if (!b.active) continue;
+            // 骨头拾取判定（稍大一点增加手感）
+            if (player.x + player.w > b.x - 10 && player.x < b.x + b.w + 10 &&
+                player.y + player.h > b.y - 10 && player.y < b.y + b.h + 10) {
+                b.active = false; player.bonesCollected++;
+            }
+        }
+        for (auto& ob : obstacles) {
+            if (!ob.active) continue;
+            int m = 15; // 碰撞箱向内收缩 15 像素，防止擦空气边死
+            
+            if (ob.type == PIT) {
+                // 坑洞判定：只要踩在地上且进入坑的水平范围就死
+                if (player.onGround && player.x + player.w > ob.x && player.x < ob.x + ob.w) { changeState(GAME_OVER, false); return; }
+            } else {
+                // 普通障碍判定
+                if (player.invulnerableTimer == 0 &&
+                    player.x + player.w - m > ob.x && player.x + m < ob.x + ob.w &&
+                    player.y + player.h - m > ob.y && player.y + m < ob.y + ob.h) {
+                    
+                    player.hp--;                   
+                    player.invulnerableTimer = 60; // 获得1秒无敌
+                    player.slowdownTimer = 60;     // 获得1秒减速惩罚
+                    
+                    if (player.hp <= 0) { changeState(GAME_OVER, false); return; }
+                }
+            }
+        }
+    }
+
+    void updateVehicleSelect() {
+        if (GetAsyncKeyState('1') & 0x8001) { 
+            player.vehicle = SURFBOARD; player.maxHp = 5; player.hp = 5; 
+            changeState(WATER_LEVEL, true); // 使用幕布转场
+        }
+        else if ((GetAsyncKeyState('2') & 0x8001) && player.bonesCollected >= BONE_TARGET_BOAT) { 
+            player.vehicle = BOAT; player.maxHp = 8; player.hp = 8; 
+            changeState(WATER_LEVEL, true); // 使用幕布转场
+        }
+    }
+
+    void updateWater() {
+        if (frameCount % 60 == 0 && timeLeft > 0) timeLeft--;
+        if (timeLeft <= 0) { changeState(GAME_OVER, false); return; }
+        
+        player.updateTimers(); 
+        player.updateWater();
+        
+        // 不同载具的基础速度差异
+        float baseSpeed = (player.vehicle == SURFBOARD) ? 8.0f : 14.0f; 
+        float currentSpeed = baseSpeed * (player.slowdownTimer > 0 ? 0.3f : 1.0f);
+        waterScrollOffset += currentSpeed;
+        
+        for (auto& ob : obstacles) { 
+            float obSpeed = currentSpeed;
+            if (ob.type == SHARK) obSpeed += 6.0f; // 鲨鱼主动向左突进
+            ob.x -= obSpeed; 
+            if (ob.x < -ob.w) ob.active = false; 
+        }
+        
+        detectWaterCollisions();
+        obstacles.erase(std::remove_if(obstacles.begin(), obstacles.end(), [](const Obstacle& o) { return !o.active; }), obstacles.end());
+        
+        if (waterScrollOffset + player.x >= waterEndX) { 
+            changeState(FINAL_LAND, true); // 逃出水面，拉上幕布转到重逢大陆
+            return;
+        }
+    }
+
+    void detectWaterCollisions() {
+        int m = 15; 
+        for (auto& ob : obstacles) {
+            if (!ob.active) continue;
+            if (player.invulnerableTimer == 0 &&
+                player.x + player.w - m > ob.x && player.x + m < ob.x + ob.w &&
+                player.y + player.h - m > ob.y && player.y + m < ob.y + ob.h) {
+                player.hp--; player.invulnerableTimer = 60; player.slowdownTimer = 60; 
+                if (player.hp <= 0) { changeState(GAME_OVER, false); return; }
+            }
+        }
+    }
+
+    void updateFinalLand() {
+        static bool lastSpaceState = false; 
+        bool currentSpaceState = GetAsyncKeyState(VK_SPACE) & 0x8000; 
+        if (currentSpaceState && !lastSpaceState) { player.jump(); }
+        lastSpaceState = currentSpaceState; 
+
+        player.updateLand();
+        landScrollOffset += LAND_SPEED; 
+        
+        // 计算小白在视野中的坐标，随着卷轴推进逐渐进入屏幕
+        float xiaobaiX = finalLandEndX - 200 - landScrollOffset;
+        if (player.x + player.w >= xiaobaiX + 20) {
+            changeState(VICTORY, false); // 拥抱后立刻出胜利画面
+            return;
+        }
+    }
+
+    void updateVictory() { 
+        if (GetAsyncKeyState('R') & 0x8001) changeState(LAND_LEVEL, false); 
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8001) changeState(MENU, false); 
+    }
+    
+    void updateGameOver() { 
+        if (GetAsyncKeyState('R') & 0x8001) changeState(LAND_LEVEL, false); 
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8001) changeState(MENU, false); 
+    }
+
+    // ------------------------------------------
+    // 渲染管线
+    // ------------------------------------------
+    
+    // UI 层渲染
+    void drawUI() {
+        settextcolor(BLACK);
+        settextstyle(24, 0, _T("楷体"));
+        TCHAR buf[256]; 
+        swprintf_s(buf, _T("剩余时间: %d   收集骨头: %d"), timeLeft, player.bonesCollected); 
+        outtextxy(30, 20, buf);
+
+        outtextxy(30, 60, _T("生命值:"));
+        for (int i = 0; i < player.maxHp; i++) {
+            if (i < player.hp) setfillcolor(RED);      
+            else setfillcolor(0xDDDDDD);               
+            solidrectangle(130 + i * 30, 64, 150 + i * 30, 84); 
+        }
+    }
+
+    // 转场特效渲染：使用 Smoothstep 曲线实现柔和的拉幕效果
+    void drawTransition() {
+        if (!isTransitioning) return;
+        
+        float half = transitionMax / 2.0f;
+        // 计算归一化时间比例 (0 -> 1 -> 0)
+        float ratio = (transitionTimer <= half) ? (transitionTimer / half) : (1.0f - ((transitionTimer - half) / half));
+        ratio = ratio * ratio * (3 - 2 * ratio); 
+        
+        int h = (int)((HEIGHT / 2) * ratio) + 2; 
+        setfillcolor(BLACK);
+        solidrectangle(0, 0, WIDTH, h);                // 顶幕向下落
+        solidrectangle(0, HEIGHT - h, WIDTH, HEIGHT);  // 底幕向上升
+    }
+
+    void draw() {
+        cleardevice();
+        
+        // 核心场景分发
+        switch (state) {
+            case MENU:          drawMenu(); break;
+            case LAND_LEVEL:    drawLand(); break;
+            case VEHICLE_SELECT:drawVehicleSelect(); break;
+            case WATER_LEVEL:   drawWater(); break;
+            case FINAL_LAND:    drawFinalLand(); break; 
+            case VICTORY:       drawVictory(); break;
+            case GAME_OVER:     drawGameOver(); break;
+        }
+        
+        // 后期处理特效覆盖
+        drawTransition();
+    }
+
+    void drawMenu() {
+        if (assets.imgMenuBg.img) putimage(0, 0, assets.imgMenuBg.img);
+        else { setfillcolor(0x87CEEB); solidrectangle(0,0,WIDTH,HEIGHT); outtextxy(400,300,L"封面缺失"); }
+    }
+
+    void drawLand() {
+        // 1. 远景层
+        if (assets.imgSky.img) putimage(0, 0, assets.imgSky.img);
+        else { setfillcolor(0x87CEEB); solidrectangle(0,0,WIDTH,HEIGHT); }
+
+        // 2. 地面层（使用模运算实现地砖的无限循环拼接）
+        if (assets.imgGround.img) {
+            int gw = assets.imgGround.w ? assets.imgGround.w : 200;
+            for (int i = -(int((int)landScrollOffset % gw)); i < WIDTH; i += gw)
+                putimage(i, GROUND_Y, assets.imgGround.img);
+        } else { setfillcolor(0x8B4513); solidrectangle(0,GROUND_Y,WIDTH,HEIGHT); }
+
+        // 3. 道具层
+        for (auto& b : bones) {
+            int dx = (int)b.x; 
+            if (assets.imgBone.img) putimage(dx, (int)b.y, assets.imgBone.img);
+            else { setfillcolor(0xFFFFE0); solidellipse(dx,(int)b.y, dx+b.w,(int)b.y+b.h); }
+        }
+
+        // 4. 障碍层
+        for (auto& ob : obstacles) {
+            int dx = (int)ob.x;
+            IMAGE* img = nullptr;
+            switch (ob.type) { case ROCK: img=assets.imgRock.img; break; case PIT: img=assets.imgPit.img; break; case STUMP: img=assets.imgStump.img; break; }
+            if (img) putimage(dx, (int)ob.y, img);
+            else { setfillcolor(0x808080); solidrectangle(dx,(int)ob.y, dx+ob.w,(int)ob.y+ob.h); }
+        }
+
+        // 5. 角色层
+        AnimClip* clip = player.onGround ? &assets.animRun : &assets.animJump;
+        IMAGE* frame = clip->update(); 
+        
+        // 无敌闪烁：若受击，通过帧计时器控制人物“隐身”几帧来实现闪烁错觉
+        if (player.invulnerableTimer == 0 || (player.invulnerableTimer / 5) % 2 == 0) {
+            if (frame) putimage((int)player.x, (int)player.y, frame);
+            else { setfillcolor(0xFFD700); solidellipse((int)player.x,(int)player.y,(int)player.x+player.w,(int)player.y+player.h); }
+        }
+        
+        // 6. UI 头像层
+        drawUI(); 
+    }
+
+    void drawVehicleSelect() {
+        if (assets.imgSky.img) putimage(0, 0, assets.imgSky.img);
+        else { setfillcolor(0x87CEEB); solidrectangle(0,0,WIDTH,HEIGHT); }
+        settextcolor(BLACK);
+        settextstyle(32,0,_T("楷体")); outtextxy(WIDTH/2-250,120,_T("选择水上载具 (按数字键)进入下半场"));
+        TCHAR buf[256]; swprintf_s(buf, _T("当前骨头：%d"), player.bonesCollected); outtextxy(WIDTH/2-120,180,buf);
+        outtextxy(WIDTH/2-250,260,_T("1. 冲浪板 (5滴血，中速躲避流)"));
+        if (player.bonesCollected >= BONE_TARGET_BOAT) outtextxy(WIDTH/2-250,320,_T("2. 小船 (8滴血！极速冲刺流！)"));
+        else { settextcolor(0x808080); outtextxy(WIDTH/2-250,320,_T("2. 小船 (需要25个骨头解锁)")); }
+        settextcolor(BLACK); 
+    }
+
+    void drawWater() {
+        if (assets.imgWater.img) putimage(0, 0, assets.imgWater.img);
+        else { setfillcolor(0x4682B4); solidrectangle(0,0,WIDTH,HEIGHT); }
+        for (auto& ob : obstacles) {
+            int dx = (int)ob.x;
+            IMAGE* img = nullptr;
+            switch(ob.type) { case REEF: img=assets.imgReef.img; break; case WHIRLPOOL: img=assets.imgWhirlpool.img; break; case SHARK: img=assets.imgShark.img; break; }
+            if (img) putimage(dx,(int)ob.y,img);
+            else { setfillcolor(0x808080); solidrectangle(dx,(int)ob.y,dx+ob.w,(int)ob.y+ob.h); }
+        }
+        AnimClip* clip = (player.vehicle == SURFBOARD) ? &assets.animSurf : &assets.animBoat;
+        IMAGE* frame = clip->update();
+        if (player.invulnerableTimer == 0 || (player.invulnerableTimer / 5) % 2 == 0) {
+            if (frame) putimage((int)player.x, (int)player.y, frame);
+            else { setfillcolor(0xFFD700); solidellipse((int)player.x,(int)player.y,(int)player.x+player.w,(int)player.y+player.h); }
+        }
+        drawUI(); 
+    }
+
+    void drawFinalLand() {
+        if (assets.imgSky.img) putimage(0, 0, assets.imgSky.img);
+        else { setfillcolor(0x87CEEB); solidrectangle(0,0,WIDTH,HEIGHT); }
+
+        if (assets.imgGround.img) {
+            int gw = assets.imgGround.w ? assets.imgGround.w : 200;
+            for (int i = -(int((int)landScrollOffset % gw)); i < WIDTH; i += gw)
+                putimage(i, GROUND_Y, assets.imgGround.img);
+        } else { setfillcolor(0x8B4513); solidrectangle(0,GROUND_Y,WIDTH,HEIGHT); }
+
+        // 动态计算小白入场位置
+        int xiaobaiX = (int)(finalLandEndX - 200 - landScrollOffset);
+        if (assets.imgXiaobai.img) {
+            putimage(xiaobaiX, GROUND_Y - assets.imgXiaobai.h, assets.imgXiaobai.img);
+        } else { 
+            // 替位方块（防素材丢失）
+            setfillcolor(0xFF00FF); 
+            solidrectangle(xiaobaiX, GROUND_Y - 80, xiaobaiX + 60, GROUND_Y); 
+            settextcolor(WHITE);
+            settextstyle(20,0,_T("黑体"));
+            outtextxy(xiaobaiX+5, GROUND_Y - 50, _T("小白"));
+        }
+
+        AnimClip* clip = player.onGround ? &assets.animRun : &assets.animJump;
+        IMAGE* frame = clip->update(); 
+        if (frame) putimage((int)player.x, (int)player.y, frame);
+        else { setfillcolor(0xFFD700); solidellipse((int)player.x,(int)player.y,(int)player.x+player.w,(int)player.y+player.h); }
+        
+        settextcolor(BLACK);
+        settextstyle(30, 0, _T("楷体"));
+        outtextxy(WIDTH/2 - 150, 100, _T("奔向小白，完成拥抱！"));
+    }
+
+    void drawVictory() {
+        if (assets.imgEndBg.img) putimage(0, 0, assets.imgEndBg.img);
+        else { setfillcolor(0x228B22); solidrectangle(0,0,WIDTH,HEIGHT); outtextxy(400,300,L"拥抱成功！"); }
+        settextcolor(RED);
+        settextstyle(48,0,_T("楷体")); outtextxy(WIDTH/2-100, HEIGHT/2-60, L"胜利！");
+        settextcolor(BLACK);
+        settextstyle(24,0,_T("楷体")); outtextxy(WIDTH/2-180, HEIGHT/2+20, L"按R重新开始  ESC返回菜单");
+    }
+
+    void drawGameOver() {
+        if (assets.imgSky.img) putimage(0, 0, assets.imgSky.img);
+        else { setfillcolor(0x333333); solidrectangle(0,0,WIDTH,HEIGHT); }
+        settextcolor(RED);
+        settextstyle(48,0,_T("楷体")); outtextxy(WIDTH/2-100, HEIGHT/2-60, L"挑战失败");
+        settextcolor(BLACK);
+        settextstyle(24,0,_T("楷体")); outtextxy(WIDTH/2-180, HEIGHT/2+20, L"按R重新挑战  ESC返回菜单");
+    }
+};
+
+// ==========================================
+// 5. 引擎入口点
+// ==========================================
+int main() {
+    initgraph(WIDTH, HEIGHT);
+    setbkcolor(0xFFFFFF);     // 默认底色为白
+    setbkmode(TRANSPARENT);   // 消除文字绘制自带的底色白框
+    settextcolor(BLACK);      // 默认画笔字色为黑
+    
+    BeginBatchDraw();         // 开启双缓冲防闪烁
+    Game game;
+    
+    // 标准游戏主循环
+    while (true) {
+        if (_kbhit()) {
+            if (_getch() == 27) break; // 捕获 ESC 退出
+        }
+        
+        game.update();        // 帧更新（物理及状态流转）
+        game.draw();          // 帧绘制
+        FlushBatchDraw();     // 将内存缓冲区刷入屏幕
+        Sleep(16);            // 控制在约 60 帧每秒
+    }
+    
+    EndBatchDraw();
+    closegraph();
+    return 0;
+}
